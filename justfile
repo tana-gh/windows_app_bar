@@ -13,4 +13,7 @@ lint:
 test:
     cargo test --workspace
 
+example-basic:
+    cargo run -p windows_app_bar_example_basic
+
 check-all: format lint test

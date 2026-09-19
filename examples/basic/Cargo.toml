@@ -1,0 +1,14 @@
+[package]
+name = "windows_app_bar_example_basic"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A basic runnable example for windows_app_bar"
+publish = false
+
+[dependencies]
+raw-window-handle.workspace = true
+windows.workspace = true
+windows_app_bar = { path = "../../core" }
