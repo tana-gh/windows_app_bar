@@ -1,0 +1,14 @@
+[package]
+name = "windows_app_bar"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[dependencies]
+log.workspace = true
+raw-window-handle.workspace = true
+thiserror.workspace = true
+windows.workspace = true
