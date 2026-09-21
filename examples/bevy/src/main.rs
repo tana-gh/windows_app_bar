@@ -36,14 +36,16 @@ mod app {
             .add_plugins(DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
                     title: "windows_app_bar Bevy example".into(),
-                    resolution: (1280, APP_BAR_HEIGHT).into(),
+                    resolution: (180, 120).into(),
                     decorations: false,
                     resizable: false,
                     ..default()
                 }),
                 ..default()
             }))
-            .add_systems(Startup, install_primary_app_bar)
+            // A camera keeps the swapchain rendering each frame. Without one,
+            // Bevy only performs the initial no-camera clear.
+            .add_systems(Startup, (setup_camera, install_primary_app_bar))
             // This must run before Bevy removes the native window in response
             // to a close request or AppExit.
             .add_systems(
@@ -74,6 +76,10 @@ mod app {
                 Err(error) => eprintln!("failed to install Bevy AppBar: {error}"),
             }
         });
+    }
+
+    fn setup_camera(mut commands: Commands) {
+        commands.spawn(Camera2d);
     }
 
     fn unregister_app_bar_before_shutdown(
