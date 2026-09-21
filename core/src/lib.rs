@@ -8,28 +8,24 @@
 #![cfg(windows)]
 
 use std::{
-    cell::RefCell,
-    collections::HashMap,
-    ffi::c_void,
-    marker::PhantomData,
-    mem::{size_of, transmute},
-    rc::Rc,
+    cell::RefCell, collections::HashMap, ffi::c_void, marker::PhantomData, mem::size_of, rc::Rc,
 };
 
 use log::debug;
 use raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle};
 use thiserror::Error;
 use windows::Win32::{
-    Foundation::{GetLastError, HWND, LPARAM, LRESULT, RECT, SetLastError, WIN32_ERROR, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
     UI::{
         Shell::{
             ABE_BOTTOM, ABE_LEFT, ABE_RIGHT, ABE_TOP, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE,
-            ABM_SETPOS, ABM_WINDOWPOSCHANGED, ABN_POSCHANGED, APPBARDATA, SHAppBarMessage,
+            ABM_SETPOS, ABM_WINDOWPOSCHANGED, ABN_POSCHANGED, APPBARDATA, DefSubclassProc,
+            RemoveWindowSubclass, SHAppBarMessage, SetWindowSubclass,
         },
         WindowsAndMessaging::{
-            CallWindowProcW, GWLP_WNDPROC, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE,
-            SW_SHOWNA, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowLongPtrW,
-            SetWindowPos, ShowWindow, WM_APP, WM_DESTROY, WM_WINDOWPOSCHANGED, WNDPROC,
+            GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE,
+            SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowPos, ShowWindow, WM_APP, WM_DESTROY,
+            WM_WINDOWPOSCHANGED,
         },
     },
 };
@@ -39,6 +35,8 @@ use windows::Win32::{
 /// Use [`AppBar::register_with_callback_message`] if this conflicts with a
 /// message already used by the host application.
 pub const APP_BAR_CALLBACK_MESSAGE: u32 = WM_APP + 0x3a0;
+
+const APP_BAR_SUBCLASS_ID: usize = 0x77_41_42_00;
 
 /// The desktop edge occupied by an AppBar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,11 +77,11 @@ pub enum AppBarError {
     Windows(#[from] windows::core::Error),
 
     #[error(
-        "AppBar registration failed: {registration_error}; additionally failed to restore the original window procedure: {restore_error}"
+        "AppBar registration failed: {registration_error}; additionally failed to remove the AppBar window subclass: {subclass_error}"
     )]
-    SubclassRegistrationRollback {
+    SubclassRegistrationCleanup {
         registration_error: Box<AppBarError>,
-        restore_error: windows::core::Error,
+        subclass_error: windows::core::Error,
     },
 }
 
@@ -149,7 +147,6 @@ thread_local! {
 #[derive(Debug)]
 struct SubclassState {
     app_bar: Option<AppBar>,
-    previous_wnd_proc: WNDPROC,
     callback_message: u32,
     attached: bool,
     operation_in_progress: bool,
@@ -448,11 +445,8 @@ impl SubclassedAppBar {
         callback_message: u32,
     ) -> Result<Self, AppBarError> {
         let hwnd = hwnd_from_window(window)?;
-        let previous_wnd_proc = replace_wnd_proc(hwnd, Some(subclassed_app_bar_window_proc))?;
-
         let state = Rc::new(RefCell::new(SubclassState {
             app_bar: None,
-            previous_wnd_proc,
             callback_message,
             attached: true,
             // Shell calls made during registration may synchronously enter the
@@ -465,12 +459,18 @@ impl SubclassedAppBar {
         SUBCLASSED_APP_BARS.with(|app_bars| {
             app_bars.borrow_mut().insert(hwnd.0 as isize, state.clone());
         });
+        if let Err(error) = install_window_subclass(hwnd) {
+            SUBCLASSED_APP_BARS.with(|app_bars| {
+                app_bars.borrow_mut().remove(&(hwnd.0 as isize));
+            });
+            return Err(error);
+        }
 
         let app_bar =
             match AppBar::register_with_callback_message(window, edge, size, callback_message) {
                 Ok(app_bar) => app_bar,
                 Err(error) => {
-                    let (_, rollback) = detach_subclass_state(hwnd, true);
+                    let rollback = detach_subclass_state(hwnd);
                     return match rollback {
                         Ok(()) => Err(error),
                         Err(AppBarError::Windows(restore_error)) => {
@@ -478,9 +478,9 @@ impl SubclassedAppBar {
                             state.operation_in_progress = false;
                             state.pending_reposition = false;
                             state.pending_window_position_changed = false;
-                            Err(AppBarError::SubclassRegistrationRollback {
+                            Err(AppBarError::SubclassRegistrationCleanup {
                                 registration_error: Box::new(error),
-                                restore_error,
+                                subclass_error: restore_error,
                             })
                         }
                         Err(rollback_error) => Err(rollback_error),
@@ -551,13 +551,12 @@ impl SubclassedAppBar {
         self.with_app_bar(AppBar::hide)
     }
 
-    /// Removes the AppBar and restores the owner's original window procedure.
+    /// Removes the AppBar and removes this library's window subclass.
     ///
     /// Call this before destroying the native window so cleanup errors can be
     /// reported to the caller.
     pub fn unregister(self) -> Result<(), AppBarError> {
-        let (_, result) = detach_subclass_state(self.hwnd, true);
-        result
+        detach_subclass_state(self.hwnd)
     }
 
     /// Runs `operation` with the registered AppBar.
@@ -576,8 +575,7 @@ impl SubclassedAppBar {
 
 impl Drop for SubclassedAppBar {
     fn drop(&mut self) {
-        let (_, result) = detach_subclass_state(self.hwnd, true);
-        if let Err(error) = result {
+        if let Err(error) = detach_subclass_state(self.hwnd) {
             debug!("failed to detach AppBar during drop: {error}");
         }
     }
@@ -591,22 +589,17 @@ fn hwnd_from_window(window: &impl HasWindowHandle) -> Result<HWND, AppBarError> 
     Ok(HWND(handle.hwnd.get() as *mut c_void))
 }
 
-fn replace_wnd_proc(hwnd: HWND, new_wnd_proc: WNDPROC) -> Result<WNDPROC, AppBarError> {
+fn install_window_subclass(hwnd: HWND) -> Result<(), AppBarError> {
     unsafe {
-        // SetWindowLongPtrW can validly return zero when the previous value
-        // was zero. Clear last-error first so that case is distinguishable
-        // from an API failure.
-        SetLastError(WIN32_ERROR(0));
-        let previous_wnd_proc = SetWindowLongPtrW(
+        SetWindowSubclass(
             hwnd,
-            GWLP_WNDPROC,
-            transmute::<WNDPROC, isize>(new_wnd_proc),
-        );
-        if previous_wnd_proc == 0 && GetLastError().0 != 0 {
-            return Err(windows::core::Error::from_thread().into());
-        }
-        Ok(transmute::<isize, WNDPROC>(previous_wnd_proc))
+            Some(subclassed_app_bar_window_proc),
+            APP_BAR_SUBCLASS_ID,
+            0,
+        )
+        .ok()?;
     }
+    Ok(())
 }
 
 unsafe extern "system" fn subclassed_app_bar_window_proc(
@@ -614,37 +607,37 @@ unsafe extern "system" fn subclassed_app_bar_window_proc(
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
+    _subclass_id: usize,
+    _reference_data: usize,
 ) -> LRESULT {
     if message == WM_DESTROY {
-        let (previous_wnd_proc, result) = detach_subclass_state(hwnd, true);
-        if let Err(error) = result {
+        if let Err(error) = detach_subclass_state(hwnd) {
             debug!("failed to detach AppBar during window destruction: {error}");
         }
-        return call_previous_wnd_proc(previous_wnd_proc, hwnd, message, wparam, lparam);
+        return call_next_subclass(hwnd, message, wparam, lparam);
     }
 
     let Some(state) = subclass_state(hwnd) else {
         return LRESULT(0);
     };
-    let (app_bar, previous_wnd_proc, consumed) = {
+    let (app_bar, consumed) = {
         let mut state = state.borrow_mut();
-        let previous_wnd_proc = state.previous_wnd_proc;
         if state.operation_in_progress {
             if message == state.callback_message {
                 if wparam.0 as u32 == ABN_POSCHANGED {
                     state.pending_reposition = true;
                 }
-                (None, previous_wnd_proc, true)
+                (None, true)
             } else {
                 if message == WM_WINDOWPOSCHANGED {
                     state.pending_window_position_changed = true;
                 }
-                (None, previous_wnd_proc, false)
+                (None, false)
             }
         } else {
             let app_bar = state.app_bar.take();
             state.operation_in_progress = app_bar.is_some();
-            (app_bar, previous_wnd_proc, false)
+            (app_bar, false)
         }
     };
 
@@ -652,7 +645,7 @@ unsafe extern "system" fn subclassed_app_bar_window_proc(
         return LRESULT(0);
     }
     let Some(mut app_bar) = app_bar else {
-        return call_previous_wnd_proc(previous_wnd_proc, hwnd, message, wparam, lparam);
+        return call_next_subclass(hwnd, message, wparam, lparam);
     };
     let consumed = match app_bar.handle_window_message(message, wparam.0, lparam.0) {
         Ok(consumed) => consumed,
@@ -667,29 +660,32 @@ unsafe extern "system" fn subclassed_app_bar_window_proc(
     if consumed {
         LRESULT(0)
     } else {
-        call_previous_wnd_proc(previous_wnd_proc, hwnd, message, wparam, lparam)
+        call_next_subclass(hwnd, message, wparam, lparam)
     }
 }
 
-fn detach_subclass_state(hwnd: HWND, restore_wnd_proc: bool) -> (WNDPROC, Result<(), AppBarError>) {
+fn detach_subclass_state(hwnd: HWND) -> Result<(), AppBarError> {
     let state =
         SUBCLASSED_APP_BARS.with(|app_bars| app_bars.borrow().get(&(hwnd.0 as isize)).cloned());
     let Some(state) = state else {
-        return (None, Ok(()));
+        return Ok(());
     };
-    let previous_wnd_proc = {
+    {
         let state = state.borrow();
         if !state.attached {
-            return (state.previous_wnd_proc, Ok(()));
+            return Ok(());
         }
-        state.previous_wnd_proc
-    };
+    }
 
-    if restore_wnd_proc && let Err(error) = replace_wnd_proc(hwnd, previous_wnd_proc) {
-        // Keep the state and its map entry intact: the active WndProc still
-        // points at us, so discarding its forwarding state would break the
-        // window's message chain.
-        return (previous_wnd_proc, Err(error));
+    unsafe {
+        // This removes only the callback identified by our procedure and ID,
+        // leaving any earlier or later subclasses in the chain untouched.
+        RemoveWindowSubclass(
+            hwnd,
+            Some(subclassed_app_bar_window_proc),
+            APP_BAR_SUBCLASS_ID,
+        )
+        .ok()?;
     }
 
     SUBCLASSED_APP_BARS.with(|app_bars| {
@@ -707,10 +703,10 @@ fn detach_subclass_state(hwnd: HWND, restore_wnd_proc: bool) -> (WNDPROC, Result
         // The owner may outlive this state (for example after WM_CLOSE), so
         // mark it unregistered before its HWND can be destroyed.
         let result = app_bar.remove();
-        return (previous_wnd_proc, result);
+        return result;
     }
 
-    (previous_wnd_proc, Ok(()))
+    Ok(())
 }
 
 fn subclass_state(hwnd: HWND) -> Option<Rc<RefCell<SubclassState>>> {
@@ -766,18 +762,8 @@ fn finish_app_bar_operation(state: &Rc<RefCell<SubclassState>>, mut app_bar: App
     }
 }
 
-fn call_previous_wnd_proc(
-    previous_wnd_proc: WNDPROC,
-    hwnd: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    if let Some(previous_wnd_proc) = previous_wnd_proc {
-        unsafe { CallWindowProcW(Some(previous_wnd_proc), hwnd, message, wparam, lparam) }
-    } else {
-        LRESULT(0)
-    }
+fn call_next_subclass(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
 impl Drop for AppBar {
@@ -939,7 +925,6 @@ mod tests {
         ));
         let state = Rc::new(RefCell::new(SubclassState {
             app_bar: Some(app_bar_for_test(api.clone())),
-            previous_wnd_proc: None,
             callback_message: APP_BAR_CALLBACK_MESSAGE,
             attached: true,
             operation_in_progress: false,
