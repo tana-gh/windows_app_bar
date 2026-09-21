@@ -1,9 +1,40 @@
 //! A small Windows-only wrapper around the Shell AppBar API.
 //!
-//! The owner of the native window must forward its window messages to
-//! [`AppBar::handle_window_message`]. In particular, this lets the AppBar
-//! reclaim its position after another AppBar changes the available desktop
-//! area.
+//! # Choosing an API
+//!
+//! [`AppBar`] is the manual integration API. Use it when the application owns
+//! its WndProc: forward every received message to
+//! [`AppBar::handle_window_message`]. This lets the AppBar reclaim its
+//! position after another AppBar changes the available desktop area.
+//!
+//! [`SubclassedAppBar`] is the automatic integration API. It installs a
+//! Common Controls window subclass with `SetWindowSubclass`, forwards AppBar
+//! messages itself, and passes unrelated messages on through the existing
+//! subclass chain. It is suited to frameworks such as Bevy and winit, where
+//! an existing HWND is available but the application does not own its WndProc.
+//! Keep the returned value alive for as long as that window is an AppBar.
+//!
+//! # Selecting a monitor
+//!
+//! Registration APIs take a zero-based `monitor_index`. Obtain valid indices
+//! with [`enumerate_monitors`]. The index is the current
+//! `EnumDisplayMonitors` enumeration order; it is not the number displayed in
+//! Windows Display Settings and can change when the display configuration
+//! changes.
+//!
+//! # Thread affinity
+//!
+//! An AppBar must be created, used, and dropped on its HWND's owning thread.
+//!
+//! # `SubclassedAppBar` lifecycle
+//!
+//! `SubclassedAppBar` does not own its HWND. Call
+//! [`SubclassedAppBar::unregister`] on the owning thread before destroying the
+//! native window; this is the only cleanup path that reports errors. If it is
+//! missed, both [`Drop`] and `WM_DESTROY` attempt best-effort cleanup, but
+//! cannot report failure. `WM_CLOSE` is never consumed by this crate and is
+//! forwarded to the next window procedure, so the owner retains its normal
+//! close and cancellation policy.
 
 #![cfg(windows)]
 
@@ -306,7 +337,12 @@ enum SubclassMessageDispatch {
 /// original procedure.
 ///
 /// Call [`Self::unregister`] before destroying the owner `HWND`. If that is
-/// missed, a `WM_DESTROY` notification performs best-effort cleanup.
+/// missed, `Drop` and a `WM_DESTROY` notification perform best-effort cleanup
+/// without being able to report errors. `WM_CLOSE` is forwarded to the next
+/// window procedure unchanged.
+///
+/// This type does not own the window. Create, use, unregister, and drop it on
+/// the window's owning thread.
 #[derive(Debug)]
 pub struct SubclassedAppBar {
     hwnd: HWND,
@@ -395,8 +431,10 @@ impl AppBar {
         self.callback_message
     }
 
-    /// Returns whether this AppBar currently reserves desktop work area.
-    pub const fn is_visible(&self) -> bool {
+    /// Returns whether this AppBar is currently registered with the Shell.
+    ///
+    /// This does not report the native window's visibility.
+    pub const fn is_registered(&self) -> bool {
         self.registered
     }
 
@@ -441,7 +479,11 @@ impl AppBar {
         Ok(())
     }
 
-    /// Shows the AppBar and reserves its desktop work area.
+    /// Registers this AppBar with the Shell if needed, then shows its native
+    /// window without activating it.
+    ///
+    /// [`Self::is_registered`] reports the Shell registration state; it does
+    /// not report whether the native window is visible.
     pub fn show(&mut self) -> Result<(), AppBarError> {
         if !self.registered {
             self.add()?;
@@ -452,7 +494,10 @@ impl AppBar {
         Ok(())
     }
 
-    /// Hides the AppBar and releases its desktop work area.
+    /// Hides its native window and releases its Shell AppBar registration.
+    ///
+    /// [`Self::is_registered`] reports the Shell registration state; it does
+    /// not report whether the native window is visible.
     pub fn hide(&mut self) -> Result<(), AppBarError> {
         if self.registered {
             self.remove()?;
@@ -715,14 +760,16 @@ impl SubclassedAppBar {
         self.state.borrow().callback_message
     }
 
-    /// Returns whether this AppBar currently reserves desktop work area.
-    pub fn is_visible(&self) -> bool {
+    /// Returns whether this AppBar is currently registered with the Shell.
+    ///
+    /// This does not report the native window's visibility.
+    pub fn is_registered(&self) -> bool {
         self.state
             .borrow()
             .app_bar
             .as_ref()
             .expect("AppBar is available outside an operation")
-            .is_visible()
+            .is_registered()
     }
 
     /// Changes the requested thickness and immediately repositions the AppBar.
@@ -740,20 +787,23 @@ impl SubclassedAppBar {
         self.with_app_bar(|app_bar| app_bar.set_monitor_index(monitor_index))
     }
 
-    /// Shows the AppBar and reserves its desktop work area.
+    /// Registers this AppBar with the Shell if needed, then shows its native
+    /// window without activating it.
     pub fn show(&mut self) -> Result<(), AppBarError> {
         self.with_app_bar(AppBar::show)
     }
 
-    /// Hides the AppBar and releases its desktop work area.
+    /// Hides its native window and releases its Shell AppBar registration.
     pub fn hide(&mut self) -> Result<(), AppBarError> {
         self.with_app_bar(AppBar::hide)
     }
 
     /// Removes the AppBar and removes this library's window subclass.
     ///
-    /// Call this before destroying the native window so cleanup errors can be
-    /// reported to the caller.
+    /// Call this on the owner thread before destroying the native window.
+    ///
+    /// This is the only cleanup path that reports errors. If it is skipped,
+    /// `Drop` and `WM_DESTROY` perform best-effort cleanup instead.
     pub fn unregister(self) -> Result<(), AppBarError> {
         detach_subclass_state_with_api(self.hwnd, &WindowsWindowSubclassApi)
     }
