@@ -16,9 +16,10 @@ mod app {
     use std::cell::RefCell;
 
     use bevy::{
+        app::AppExit,
         ecs::system::NonSendMarker,
         prelude::*,
-        window::{PrimaryWindow, WindowPlugin},
+        window::{PrimaryWindow, WindowCloseRequested, WindowPlugin, close_when_requested},
         winit::WINIT_WINDOWS,
     };
     use windows_app_bar::{Edge, SubclassedAppBar};
@@ -43,6 +44,12 @@ mod app {
                 ..default()
             }))
             .add_systems(Startup, install_primary_app_bar)
+            // This must run before Bevy removes the native window in response
+            // to a close request or AppExit.
+            .add_systems(
+                Last,
+                unregister_app_bar_before_shutdown.before(close_when_requested),
+            )
             .run();
     }
 
@@ -67,6 +74,25 @@ mod app {
                 Err(error) => eprintln!("failed to install Bevy AppBar: {error}"),
             }
         });
+    }
+
+    fn unregister_app_bar_before_shutdown(
+        _main_thread: NonSendMarker,
+        mut close_requests: MessageReader<WindowCloseRequested>,
+        mut app_exits: MessageReader<AppExit>,
+    ) {
+        if close_requests.read().next().is_none() && app_exits.read().next().is_none() {
+            return;
+        }
+
+        // End the RefCell borrow before unregistering, because Win32 calls can
+        // synchronously re-enter the window procedure.
+        let app_bar = APP_BAR.with(|slot| slot.borrow_mut().take());
+        if let Some(app_bar) = app_bar
+            && let Err(error) = app_bar.unregister()
+        {
+            eprintln!("failed to unregister Bevy AppBar during shutdown: {error}");
+        }
     }
 }
 
