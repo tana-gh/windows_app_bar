@@ -847,32 +847,17 @@ impl SubclassedAppBar {
 
     /// Returns the edge currently requested by this AppBar.
     pub fn edge(&self) -> Edge {
-        self.state
-            .borrow()
-            .app_bar
-            .as_ref()
-            .expect("AppBar is available outside an operation")
-            .edge()
+        self.with_registered_app_bar(AppBar::edge)
     }
 
     /// Returns the zero-based monitor index selected for this AppBar.
     pub fn monitor_index(&self) -> usize {
-        self.state
-            .borrow()
-            .app_bar
-            .as_ref()
-            .expect("AppBar is available outside an operation")
-            .monitor_index()
+        self.with_registered_app_bar(AppBar::monitor_index)
     }
 
     /// Returns this AppBar's requested thickness in physical pixels.
     pub fn size(&self) -> u32 {
-        self.state
-            .borrow()
-            .app_bar
-            .as_ref()
-            .expect("AppBar is available outside an operation")
-            .size()
+        self.with_registered_app_bar(AppBar::size)
     }
 
     /// Returns the Shell callback message registered for this AppBar.
@@ -884,12 +869,7 @@ impl SubclassedAppBar {
     ///
     /// This does not report the native window's visibility.
     pub fn is_registered(&self) -> bool {
-        self.state
-            .borrow()
-            .app_bar
-            .as_ref()
-            .expect("AppBar is available outside an operation")
-            .is_registered()
+        self.with_registered_app_bar(AppBar::is_registered)
     }
 
     /// Changes the requested thickness and immediately repositions the AppBar.
@@ -939,6 +919,20 @@ impl SubclassedAppBar {
         let result = operation(&mut app_bar);
         finish_app_bar_operation(&self.state, app_bar);
         result
+    }
+
+    /// Runs a read-only operation with the AppBar stored in this subclass state.
+    ///
+    /// The AppBar is temporarily removed only while an internal mutable
+    /// operation is running. Public read accessors cannot overlap that
+    /// operation, so its presence is an invariant here.
+    fn with_registered_app_bar<R>(&self, operation: impl FnOnce(&AppBar) -> R) -> R {
+        let state = self.state.borrow();
+        let app_bar = state
+            .app_bar
+            .as_ref()
+            .expect("AppBar is available outside an operation");
+        operation(app_bar)
     }
 }
 
@@ -1387,6 +1381,14 @@ mod tests {
         }))
     }
 
+    fn subclassed_app_bar_for_test(app_bar: AppBar) -> SubclassedAppBar {
+        SubclassedAppBar {
+            hwnd: HWND::default(),
+            state: subclass_state_for_test(Some(app_bar)),
+            _thread_affinity: PhantomData,
+        }
+    }
+
     #[test]
     fn thickness_is_applied_from_each_requested_edge() {
         let original = RECT {
@@ -1509,6 +1511,18 @@ mod tests {
             hwnd_from_window(&NonWin32TestWindow),
             Err(AppBarError::NotAWin32Window)
         ));
+    }
+
+    #[test]
+    fn subclassed_app_bar_read_accessors_use_the_registered_app_bar() {
+        let api = Rc::new(MockAppBarApi::new(RECT::default(), false));
+        let app_bar = subclassed_app_bar_for_test(app_bar_for_test(api));
+
+        assert_eq!(app_bar.edge(), Edge::Bottom);
+        assert_eq!(app_bar.monitor_index(), 0);
+        assert_eq!(app_bar.size(), 30);
+        assert_eq!(app_bar.callback_message(), APP_BAR_CALLBACK_MESSAGE);
+        assert!(app_bar.is_registered());
     }
 
     #[test]
