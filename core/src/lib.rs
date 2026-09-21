@@ -16,6 +16,7 @@ use raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle};
 use thiserror::Error;
 use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
+    Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HMONITOR, MONITORINFO},
     UI::{
         Shell::{
             ABE_BOTTOM, ABE_LEFT, ABE_RIGHT, ABE_TOP, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE,
@@ -23,9 +24,8 @@ use windows::Win32::{
             RemoveWindowSubclass, SHAppBarMessage, SetWindowSubclass,
         },
         WindowsAndMessaging::{
-            GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE,
-            SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowPos, ShowWindow, WM_APP, WM_DESTROY,
-            WM_WINDOWPOSCHANGED,
+            SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowPos,
+            ShowWindow, WM_APP, WM_DESTROY, WM_WINDOWPOSCHANGED,
         },
     },
 };
@@ -45,6 +45,43 @@ pub enum Edge {
     Top,
     Right,
     Bottom,
+}
+
+/// The bounds of a display monitor in virtual-screen physical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorRect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+impl From<RECT> for MonitorRect {
+    fn from(rect: RECT) -> Self {
+        Self {
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+        }
+    }
+}
+
+/// A monitor in the order used by the AppBar registration APIs.
+///
+/// `index` is zero-based and is the order returned by `EnumDisplayMonitors`.
+/// It is not the number shown by Windows Display Settings, and may change when
+/// the display configuration changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorInfo {
+    pub index: usize,
+    pub bounds: MonitorRect,
+}
+
+/// Enumerates monitors in the order accepted by [`AppBar::register`] and
+/// [`SubclassedAppBar::register`].
+pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>, AppBarError> {
+    WindowsAppBarApi::enumerate_monitors()
 }
 
 impl Edge {
@@ -70,6 +107,9 @@ pub enum AppBarError {
     #[error("the AppBar size must be greater than zero")]
     InvalidSize,
 
+    #[error("display monitor at index {index} was not found")]
+    MonitorNotFound { index: usize },
+
     #[error("Shell rejected AppBar {operation}")]
     ShellOperationFailed { operation: &'static str },
 
@@ -92,7 +132,7 @@ pub enum AppBarError {
 trait AppBarApi: std::fmt::Debug {
     fn app_bar_message(&self, message: u32, data: &mut APPBARDATA) -> usize;
     fn set_window_pos(&self, hwnd: HWND, rect: RECT) -> Result<(), AppBarError>;
-    fn screen_size(&self) -> (i32, i32);
+    fn monitor_rect(&self, index: usize) -> Result<RECT, AppBarError>;
 }
 
 #[derive(Debug)]
@@ -118,9 +158,62 @@ impl AppBarApi for WindowsAppBarApi {
         Ok(())
     }
 
-    fn screen_size(&self) -> (i32, i32) {
-        unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
+    fn monitor_rect(&self, index: usize) -> Result<RECT, AppBarError> {
+        Self::enumerate_monitors().and_then(|monitors| {
+            monitors
+                .get(index)
+                .map(|monitor| RECT {
+                    left: monitor.bounds.left,
+                    top: monitor.bounds.top,
+                    right: monitor.bounds.right,
+                    bottom: monitor.bounds.bottom,
+                })
+                .ok_or(AppBarError::MonitorNotFound { index })
+        })
     }
+}
+
+impl WindowsAppBarApi {
+    fn enumerate_monitors() -> Result<Vec<MonitorInfo>, AppBarError> {
+        let mut handles = Vec::<HMONITOR>::new();
+        unsafe {
+            EnumDisplayMonitors(
+                None,
+                None,
+                Some(collect_monitor_handle),
+                LPARAM((&mut handles as *mut Vec<HMONITOR>) as isize),
+            )
+            .ok()?;
+        }
+
+        handles
+            .into_iter()
+            .enumerate()
+            .map(|(index, handle)| {
+                let mut info = MONITORINFO {
+                    cbSize: size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
+                unsafe { GetMonitorInfoW(handle, &mut info).ok()? };
+                Ok(MonitorInfo {
+                    index,
+                    bounds: info.rcMonitor.into(),
+                })
+            })
+            .collect()
+    }
+}
+
+unsafe extern "system" fn collect_monitor_handle(
+    monitor: HMONITOR,
+    _hdc: windows::Win32::Graphics::Gdi::HDC,
+    _rect: *mut RECT,
+    data: LPARAM,
+) -> windows::core::BOOL {
+    // `data` points to `handles`, which remains alive for the synchronous
+    // EnumDisplayMonitors call above.
+    unsafe { (&mut *(data.0 as *mut Vec<HMONITOR>)).push(monitor) };
+    true.into()
 }
 
 /// A registered Windows Shell AppBar.
@@ -131,6 +224,7 @@ impl AppBarApi for WindowsAppBarApi {
 #[derive(Debug)]
 pub struct AppBar {
     hwnd: HWND,
+    monitor_index: usize,
     edge: Edge,
     size: i32,
     callback_message: u32,
@@ -170,26 +264,35 @@ pub struct SubclassedAppBar {
 }
 
 impl AppBar {
-    /// Registers `window` as an AppBar using [`APP_BAR_CALLBACK_MESSAGE`] for
-    /// Shell notifications.
+    /// Registers `window` as an AppBar on `monitor_index` using
+    /// [`APP_BAR_CALLBACK_MESSAGE`] for Shell notifications.
     ///
-    /// This only registers the AppBar and reserves its desktop work area; it
-    /// does not make the window visible. Call [`Self::show`] when appropriate.
+    /// `monitor_index` is zero-based in [`enumerate_monitors`] order. This
+    /// only registers the AppBar and reserves its desktop work area; it does
+    /// not make the window visible. Call [`Self::show`] when appropriate.
     pub fn register(
         window: &impl HasWindowHandle,
+        monitor_index: usize,
         edge: Edge,
         size: u32,
     ) -> Result<Self, AppBarError> {
-        Self::register_with_callback_message(window, edge, size, APP_BAR_CALLBACK_MESSAGE)
+        Self::register_with_callback_message(
+            window,
+            monitor_index,
+            edge,
+            size,
+            APP_BAR_CALLBACK_MESSAGE,
+        )
     }
 
-    /// Registers `window` as an AppBar.
+    /// Registers `window` as an AppBar on `monitor_index`.
     ///
     /// `callback_message` must be forwarded from the owner window's message
     /// procedure to [`Self::handle_window_message`]. Pick a value which does
     /// not conflict with the host application's private window messages.
     pub fn register_with_callback_message(
         window: &impl HasWindowHandle,
+        monitor_index: usize,
         edge: Edge,
         size: u32,
         callback_message: u32,
@@ -206,6 +309,7 @@ impl AppBar {
 
         let mut app_bar = Self {
             hwnd: HWND(handle.hwnd.get() as *mut c_void),
+            monitor_index,
             edge,
             size,
             callback_message,
@@ -213,6 +317,9 @@ impl AppBar {
             api: Box::new(WindowsAppBarApi),
             _thread_affinity: PhantomData,
         };
+        // Reject an invalid index before registering with the Shell, so no
+        // rollback is needed for this caller error.
+        app_bar.api.monitor_rect(monitor_index)?;
         app_bar.add()?;
         Ok(app_bar)
     }
@@ -220,6 +327,11 @@ impl AppBar {
     /// Returns the edge currently requested by this AppBar.
     pub const fn edge(&self) -> Edge {
         self.edge
+    }
+
+    /// Returns the zero-based monitor index selected for this AppBar.
+    pub const fn monitor_index(&self) -> usize {
+        self.monitor_index
     }
 
     /// Returns this AppBar's requested thickness in physical pixels.
@@ -261,6 +373,20 @@ impl AppBar {
             self.apply_position(edge, self.size)?;
         }
         self.edge = edge;
+        Ok(())
+    }
+
+    /// Moves the AppBar to another monitor in [`enumerate_monitors`] order.
+    ///
+    /// If repositioning fails, the previous monitor index is retained.
+    pub fn set_monitor_index(&mut self, monitor_index: usize) -> Result<(), AppBarError> {
+        // Validate even while hidden, so a later `show` cannot fail merely
+        // because of a stale index supplied here.
+        self.api.monitor_rect(monitor_index)?;
+        if self.registered {
+            self.apply_position_for(monitor_index, self.edge, self.size)?;
+        }
+        self.monitor_index = monitor_index;
         Ok(())
     }
 
@@ -354,8 +480,17 @@ impl AppBar {
     }
 
     fn apply_position(&self, edge: Edge, size: i32) -> Result<(), AppBarError> {
+        self.apply_position_for(self.monitor_index, edge, size)
+    }
+
+    fn apply_position_for(
+        &self,
+        monitor_index: usize,
+        edge: Edge,
+        size: i32,
+    ) -> Result<(), AppBarError> {
         let mut data = self.data_for(edge);
-        data.rc = self.proposed_rect(edge, size);
+        data.rc = Self::proposed_rect(self.api.monitor_rect(monitor_index)?, edge, size);
         self.api.app_bar_message(ABM_QUERYPOS, &mut data);
         Self::apply_thickness(&mut data.rc, edge, size);
         self.api.app_bar_message(ABM_SETPOS, &mut data);
@@ -382,32 +517,31 @@ impl AppBar {
         }
     }
 
-    fn proposed_rect(&self, edge: Edge, size: i32) -> RECT {
-        let (width, height) = self.api.screen_size();
+    fn proposed_rect(monitor: RECT, edge: Edge, size: i32) -> RECT {
         match edge {
             Edge::Left => RECT {
-                left: 0,
-                top: 0,
-                right: size,
-                bottom: height,
+                left: monitor.left,
+                top: monitor.top,
+                right: monitor.left + size,
+                bottom: monitor.bottom,
             },
             Edge::Top => RECT {
-                left: 0,
-                top: 0,
-                right: width,
-                bottom: size,
+                left: monitor.left,
+                top: monitor.top,
+                right: monitor.right,
+                bottom: monitor.top + size,
             },
             Edge::Right => RECT {
-                left: width - size,
-                top: 0,
-                right: width,
-                bottom: height,
+                left: monitor.right - size,
+                top: monitor.top,
+                right: monitor.right,
+                bottom: monitor.bottom,
             },
             Edge::Bottom => RECT {
-                left: 0,
-                top: height - size,
-                right: width,
-                bottom: height,
+                left: monitor.left,
+                top: monitor.bottom - size,
+                right: monitor.right,
+                bottom: monitor.bottom,
             },
         }
     }
@@ -423,23 +557,31 @@ impl AppBar {
 }
 
 impl SubclassedAppBar {
-    /// Registers `window` as an AppBar and subclasses its window procedure so
-    /// AppBar messages are forwarded automatically.
+    /// Registers `window` as an AppBar on `monitor_index` and subclasses its
+    /// window procedure so AppBar messages are forwarded automatically.
     ///
     /// The returned value must be kept alive until before the native window is
     /// destroyed. It is bound to the window's owning thread.
     pub fn register(
         window: &impl HasWindowHandle,
+        monitor_index: usize,
         edge: Edge,
         size: u32,
     ) -> Result<Self, AppBarError> {
-        Self::register_with_callback_message(window, edge, size, APP_BAR_CALLBACK_MESSAGE)
+        Self::register_with_callback_message(
+            window,
+            monitor_index,
+            edge,
+            size,
+            APP_BAR_CALLBACK_MESSAGE,
+        )
     }
 
     /// Like [`Self::register`], but uses `callback_message` for Shell AppBar
     /// notifications.
     pub fn register_with_callback_message(
         window: &impl HasWindowHandle,
+        monitor_index: usize,
         edge: Edge,
         size: u32,
         callback_message: u32,
@@ -466,27 +608,32 @@ impl SubclassedAppBar {
             return Err(error);
         }
 
-        let app_bar =
-            match AppBar::register_with_callback_message(window, edge, size, callback_message) {
-                Ok(app_bar) => app_bar,
-                Err(error) => {
-                    let rollback = detach_subclass_state(hwnd);
-                    return match rollback {
-                        Ok(()) => Err(error),
-                        Err(AppBarError::Windows(restore_error)) => {
-                            let mut state = state.borrow_mut();
-                            state.operation_in_progress = false;
-                            state.pending_reposition = false;
-                            state.pending_window_position_changed = false;
-                            Err(AppBarError::SubclassRegistrationCleanup {
-                                registration_error: Box::new(error),
-                                subclass_error: restore_error,
-                            })
-                        }
-                        Err(rollback_error) => Err(rollback_error),
-                    };
-                }
-            };
+        let app_bar = match AppBar::register_with_callback_message(
+            window,
+            monitor_index,
+            edge,
+            size,
+            callback_message,
+        ) {
+            Ok(app_bar) => app_bar,
+            Err(error) => {
+                let rollback = detach_subclass_state(hwnd);
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(AppBarError::Windows(restore_error)) => {
+                        let mut state = state.borrow_mut();
+                        state.operation_in_progress = false;
+                        state.pending_reposition = false;
+                        state.pending_window_position_changed = false;
+                        Err(AppBarError::SubclassRegistrationCleanup {
+                            registration_error: Box::new(error),
+                            subclass_error: restore_error,
+                        })
+                    }
+                    Err(rollback_error) => Err(rollback_error),
+                };
+            }
+        };
         finish_app_bar_operation(&state, app_bar);
 
         Ok(Self {
@@ -504,6 +651,16 @@ impl SubclassedAppBar {
             .as_ref()
             .expect("AppBar is available outside an operation")
             .edge()
+    }
+
+    /// Returns the zero-based monitor index selected for this AppBar.
+    pub fn monitor_index(&self) -> usize {
+        self.state
+            .borrow()
+            .app_bar
+            .as_ref()
+            .expect("AppBar is available outside an operation")
+            .monitor_index()
     }
 
     /// Returns this AppBar's requested thickness in physical pixels.
@@ -539,6 +696,11 @@ impl SubclassedAppBar {
     /// Changes the desktop edge and immediately repositions the AppBar.
     pub fn set_edge(&mut self, edge: Edge) -> Result<(), AppBarError> {
         self.with_app_bar(|app_bar| app_bar.set_edge(edge))
+    }
+
+    /// Moves the AppBar to another monitor in [`enumerate_monitors`] order.
+    pub fn set_monitor_index(&mut self, monitor_index: usize) -> Result<(), AppBarError> {
+        self.with_app_bar(|app_bar| app_bar.set_monitor_index(monitor_index))
     }
 
     /// Shows the AppBar and reserves its desktop work area.
@@ -827,14 +989,24 @@ mod tests {
             }
         }
 
-        fn screen_size(&self) -> (i32, i32) {
-            (1920, 1080)
+        fn monitor_rect(&self, index: usize) -> Result<RECT, AppBarError> {
+            if index == 0 {
+                Ok(RECT {
+                    left: 0,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1080,
+                })
+            } else {
+                Err(AppBarError::MonitorNotFound { index })
+            }
         }
     }
 
     fn app_bar_for_test(api: Rc<MockAppBarApi>) -> AppBar {
         AppBar {
             hwnd: HWND::default(),
+            monitor_index: 0,
             edge: Edge::Bottom,
             size: 30,
             callback_message: APP_BAR_CALLBACK_MESSAGE,
@@ -871,7 +1043,7 @@ mod tests {
     }
 
     #[test]
-    fn position_changed_notification_uses_wparam_and_proposes_a_screen_edge_rect() {
+    fn position_changed_notification_uses_wparam_and_proposes_a_monitor_edge_rect() {
         let api = Rc::new(MockAppBarApi::new(
             RECT {
                 left: 0,
@@ -911,6 +1083,35 @@ mod tests {
     }
 
     #[test]
+    fn proposed_rect_uses_the_selected_monitor_bounds() {
+        let monitor = RECT {
+            left: -2560,
+            top: 100,
+            right: 0,
+            bottom: 1540,
+        };
+
+        assert_eq!(
+            AppBar::proposed_rect(monitor, Edge::Bottom, 48),
+            RECT {
+                left: -2560,
+                top: 1492,
+                right: 0,
+                bottom: 1540,
+            }
+        );
+        assert_eq!(
+            AppBar::proposed_rect(monitor, Edge::Left, 48),
+            RECT {
+                left: -2560,
+                top: 100,
+                right: -2512,
+                bottom: 1540,
+            }
+        );
+    }
+
+    #[test]
     fn failed_reposition_keeps_the_previous_size_and_edge() {
         let api = Rc::new(MockAppBarApi::new(RECT::default(), true));
         let mut app_bar = app_bar_for_test(api);
@@ -920,6 +1121,12 @@ mod tests {
 
         assert!(app_bar.set_edge(Edge::Left).is_err());
         assert_eq!(app_bar.edge(), Edge::Bottom);
+
+        assert!(matches!(
+            app_bar.set_monitor_index(1),
+            Err(AppBarError::MonitorNotFound { index: 1 })
+        ));
+        assert_eq!(app_bar.monitor_index(), 0);
     }
 
     #[test]

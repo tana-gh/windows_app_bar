@@ -61,7 +61,7 @@ mod app {
                 return;
             };
 
-            let app_bar = SubclassedAppBar::register(&**window, Edge::Bottom, APP_BAR_HEIGHT);
+            let app_bar = SubclassedAppBar::register(&**window, 0, Edge::Bottom, APP_BAR_HEIGHT);
             match app_bar {
                 Ok(app_bar) => APP_BAR.with(|slot| *slot.borrow_mut() = Some(app_bar)),
                 Err(error) => eprintln!("failed to install Bevy AppBar: {error}"),

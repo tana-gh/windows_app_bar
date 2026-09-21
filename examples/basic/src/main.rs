@@ -86,7 +86,7 @@ mod app {
             let state = Box::new(WindowState { app_bar: None });
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
 
-            let app_bar = match AppBar::register(&Window(hwnd), Edge::Bottom, 48) {
+            let app_bar = match AppBar::register(&Window(hwnd), 0, Edge::Bottom, 48) {
                 Ok(app_bar) => app_bar,
                 Err(error) => {
                     let state = Box::from_raw(window_state(hwnd));
