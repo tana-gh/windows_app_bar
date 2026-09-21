@@ -181,6 +181,9 @@ pub enum AppBarError {
     #[error("the AppBar size must be greater than zero")]
     InvalidSize,
 
+    #[error("the supplied window already has a SubclassedAppBar registered")]
+    SubclassAlreadyRegistered,
+
     #[error("display monitor at index {index} was not found")]
     MonitorNotFound { index: usize },
 
@@ -694,13 +697,9 @@ impl SubclassedAppBar {
             pending_reposition: false,
             pending_window_position_changed: false,
         }));
-        SUBCLASSED_APP_BARS.with(|app_bars| {
-            app_bars.borrow_mut().insert(hwnd.0 as isize, state.clone());
-        });
+        reserve_subclass_state(hwnd, state.clone())?;
         if let Err(error) = install_window_subclass_with_api(hwnd, &WindowsWindowSubclassApi) {
-            SUBCLASSED_APP_BARS.with(|app_bars| {
-                app_bars.borrow_mut().remove(&(hwnd.0 as isize));
-            });
+            release_subclass_state(hwnd, &state);
             return Err(error);
         }
 
@@ -844,6 +843,42 @@ fn install_window_subclass_with_api(
 ) -> Result<(), AppBarError> {
     api.install(hwnd)?;
     Ok(())
+}
+
+/// Reserves the per-HWND state slot before installing the native subclass.
+///
+/// `SetWindowSubclass` treats a repeated procedure/ID pair as an update, so
+/// allowing a second owner here would make the two Rust values interfere with
+/// each other's cleanup.
+fn reserve_subclass_state(
+    hwnd: HWND,
+    state: Rc<RefCell<SubclassState>>,
+) -> Result<(), AppBarError> {
+    SUBCLASSED_APP_BARS.with(|app_bars| {
+        let mut app_bars = app_bars.borrow_mut();
+        if app_bars
+            .get(&(hwnd.0 as isize))
+            .is_some_and(|existing| existing.borrow().attached)
+        {
+            return Err(AppBarError::SubclassAlreadyRegistered);
+        }
+
+        app_bars.insert(hwnd.0 as isize, state);
+        Ok(())
+    })
+}
+
+/// Removes a reservation only when it still belongs to `state`.
+fn release_subclass_state(hwnd: HWND, state: &Rc<RefCell<SubclassState>>) {
+    SUBCLASSED_APP_BARS.with(|app_bars| {
+        let mut app_bars = app_bars.borrow_mut();
+        if app_bars
+            .get(&(hwnd.0 as isize))
+            .is_some_and(|existing| Rc::ptr_eq(existing, state))
+        {
+            app_bars.remove(&(hwnd.0 as isize));
+        }
+    });
 }
 
 /// Completes AppBar registration after the window subclass has been installed.
@@ -1423,6 +1458,24 @@ mod tests {
             Err(AppBarError::Windows(_))
         ));
         assert_eq!(*failure.calls.borrow(), ["install"]);
+    }
+
+    #[test]
+    fn duplicate_subclass_registration_keeps_the_original_state() {
+        let hwnd = HWND::default();
+        let original = subclass_state_for_test(None);
+        reserve_subclass_state(hwnd, original.clone()).unwrap();
+
+        let duplicate = subclass_state_for_test(None);
+        assert!(matches!(
+            reserve_subclass_state(hwnd, duplicate.clone()),
+            Err(AppBarError::SubclassAlreadyRegistered)
+        ));
+
+        let registered = subclass_state(hwnd).expect("original state remains registered");
+        assert!(Rc::ptr_eq(&registered, &original));
+        assert!(!Rc::ptr_eq(&registered, &duplicate));
+        release_subclass_state(hwnd, &original);
     }
 
     #[test]
