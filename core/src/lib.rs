@@ -312,7 +312,49 @@ pub struct AppBar {
 }
 
 thread_local! {
-    static SUBCLASSED_APP_BARS: RefCell<HashMap<isize, Rc<RefCell<SubclassState>>>> = RefCell::new(HashMap::new());
+    static SUBCLASSED_APP_BARS: RefCell<SubclassRegistry> = RefCell::default();
+}
+
+/// Owns the state slots for the AppBar subclasses installed on this thread.
+///
+/// A slot is reserved before installing the native subclass so that a second
+/// Rust value cannot update the same `SetWindowSubclass` procedure/ID pair.
+#[derive(Debug, Default)]
+struct SubclassRegistry {
+    states: HashMap<isize, Rc<RefCell<SubclassState>>>,
+}
+
+impl SubclassRegistry {
+    fn reserve(
+        &mut self,
+        hwnd: HWND,
+        state: Rc<RefCell<SubclassState>>,
+    ) -> Result<(), AppBarError> {
+        if self
+            .states
+            .get(&(hwnd.0 as isize))
+            .is_some_and(|existing| existing.borrow().is_attached())
+        {
+            return Err(AppBarError::SubclassAlreadyRegistered);
+        }
+
+        self.states.insert(hwnd.0 as isize, state);
+        Ok(())
+    }
+
+    fn state(&self, hwnd: HWND) -> Option<Rc<RefCell<SubclassState>>> {
+        self.states.get(&(hwnd.0 as isize)).cloned()
+    }
+
+    fn release_if_owned(&mut self, hwnd: HWND, state: &Rc<RefCell<SubclassState>>) {
+        if self
+            .states
+            .get(&(hwnd.0 as isize))
+            .is_some_and(|existing| Rc::ptr_eq(existing, state))
+        {
+            self.states.remove(&(hwnd.0 as isize));
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -323,6 +365,97 @@ struct SubclassState {
     operation_in_progress: bool,
     pending_reposition: bool,
     pending_window_position_changed: bool,
+}
+
+impl SubclassState {
+    fn registering(callback_message: u32) -> Self {
+        Self {
+            app_bar: None,
+            callback_message,
+            attached: true,
+            operation_in_progress: true,
+            pending_reposition: false,
+            pending_window_position_changed: false,
+        }
+    }
+
+    fn is_attached(&self) -> bool {
+        self.attached
+    }
+
+    fn dispatch_message(&mut self, message: u32, wparam: usize) -> SubclassMessageDispatch {
+        if let Some(consumed) = self.defer_reentrant_message(message, wparam) {
+            return if consumed {
+                SubclassMessageDispatch::Consume
+            } else {
+                SubclassMessageDispatch::Forward
+            };
+        }
+
+        let Some(app_bar) = self.app_bar.take() else {
+            return SubclassMessageDispatch::Forward;
+        };
+        self.operation_in_progress = true;
+        SubclassMessageDispatch::HandleWithAppBar(app_bar)
+    }
+
+    /// Records a message received while an AppBar operation is in progress.
+    fn defer_reentrant_message(&mut self, message: u32, wparam: usize) -> Option<bool> {
+        if !self.operation_in_progress {
+            return None;
+        }
+
+        if message == self.callback_message {
+            if wparam as u32 == ABN_POSCHANGED {
+                self.pending_reposition = true;
+            }
+            Some(true)
+        } else {
+            if message == WM_WINDOWPOSCHANGED {
+                self.pending_window_position_changed = true;
+            }
+            Some(false)
+        }
+    }
+
+    fn begin_operation(&mut self) -> Option<AppBar> {
+        if !self.attached || self.operation_in_progress {
+            return None;
+        }
+        let app_bar = self.app_bar.take()?;
+        self.operation_in_progress = true;
+        Some(app_bar)
+    }
+
+    fn take_pending_notifications(&mut self) -> (bool, bool, u32) {
+        (
+            std::mem::take(&mut self.pending_reposition),
+            std::mem::take(&mut self.pending_window_position_changed),
+            self.callback_message,
+        )
+    }
+
+    fn finish_operation(&mut self, app_bar: AppBar) -> Option<AppBar> {
+        self.operation_in_progress = false;
+        if self.attached {
+            self.app_bar = Some(app_bar);
+            None
+        } else {
+            Some(app_bar)
+        }
+    }
+
+    fn begin_detach(&mut self) -> Option<AppBar> {
+        self.attached = false;
+        self.operation_in_progress = true;
+        self.app_bar.take()
+    }
+
+    fn abort_registration(&mut self) {
+        self.operation_in_progress = false;
+        self.pending_reposition = false;
+        self.pending_window_position_changed = false;
+    }
 }
 
 /// The action the WndProc must take after inspecting one message.
@@ -686,17 +819,10 @@ impl SubclassedAppBar {
         callback_message: u32,
     ) -> Result<Self, AppBarError> {
         let hwnd = hwnd_from_window(window)?;
-        let state = Rc::new(RefCell::new(SubclassState {
-            app_bar: None,
-            callback_message,
-            attached: true,
-            // Shell calls made during registration may synchronously enter the
-            // WndProc. Queue their relevant notifications until `app_bar` is
-            // available below.
-            operation_in_progress: true,
-            pending_reposition: false,
-            pending_window_position_changed: false,
-        }));
+        // Shell calls made during registration may synchronously enter the
+        // WndProc. Queue their relevant notifications until `app_bar` is
+        // available below.
+        let state = Rc::new(RefCell::new(SubclassState::registering(callback_message)));
         reserve_subclass_state(hwnd, state.clone())?;
         if let Err(error) = install_window_subclass_with_api(hwnd, &WindowsWindowSubclassApi) {
             release_subclass_state(hwnd, &state);
@@ -854,30 +980,13 @@ fn reserve_subclass_state(
     hwnd: HWND,
     state: Rc<RefCell<SubclassState>>,
 ) -> Result<(), AppBarError> {
-    SUBCLASSED_APP_BARS.with(|app_bars| {
-        let mut app_bars = app_bars.borrow_mut();
-        if app_bars
-            .get(&(hwnd.0 as isize))
-            .is_some_and(|existing| existing.borrow().attached)
-        {
-            return Err(AppBarError::SubclassAlreadyRegistered);
-        }
-
-        app_bars.insert(hwnd.0 as isize, state);
-        Ok(())
-    })
+    SUBCLASSED_APP_BARS.with(|app_bars| app_bars.borrow_mut().reserve(hwnd, state))
 }
 
 /// Removes a reservation only when it still belongs to `state`.
 fn release_subclass_state(hwnd: HWND, state: &Rc<RefCell<SubclassState>>) {
     SUBCLASSED_APP_BARS.with(|app_bars| {
-        let mut app_bars = app_bars.borrow_mut();
-        if app_bars
-            .get(&(hwnd.0 as isize))
-            .is_some_and(|existing| Rc::ptr_eq(existing, state))
-        {
-            app_bars.remove(&(hwnd.0 as isize));
-        }
+        app_bars.borrow_mut().release_if_owned(hwnd, state);
     });
 }
 
@@ -897,9 +1006,7 @@ fn complete_subclass_registration(
             Ok(()) => Err(error),
             Err(AppBarError::Windows(subclass_error)) => {
                 let mut state = state.borrow_mut();
-                state.operation_in_progress = false;
-                state.pending_reposition = false;
-                state.pending_window_position_changed = false;
+                state.abort_registration();
                 Err(AppBarError::SubclassRegistrationCleanup {
                     registration_error: Box::new(error),
                     subclass_error,
@@ -926,7 +1033,7 @@ unsafe extern "system" fn subclassed_app_bar_window_proc(
         return api.call_next(hwnd, message, wparam, lparam);
     }
 
-    let Some(state) = subclass_state(hwnd) else {
+    let Some(state) = registered_subclass_state(hwnd) else {
         return LRESULT(0);
     };
     let mut app_bar = match dispatch_subclass_message(&state, message, wparam.0) {
@@ -957,40 +1064,7 @@ fn dispatch_subclass_message(
     message: u32,
     wparam: usize,
 ) -> SubclassMessageDispatch {
-    let mut state = state.borrow_mut();
-    if let Some(consumed) = defer_reentrant_message(&mut state, message, wparam) {
-        return if consumed {
-            SubclassMessageDispatch::Consume
-        } else {
-            SubclassMessageDispatch::Forward
-        };
-    }
-
-    let Some(app_bar) = state.app_bar.take() else {
-        return SubclassMessageDispatch::Forward;
-    };
-    state.operation_in_progress = true;
-    SubclassMessageDispatch::HandleWithAppBar(app_bar)
-}
-
-/// Records AppBar-relevant messages received while the AppBar is temporarily
-/// unavailable, returning whether the message is consumed in that case.
-fn defer_reentrant_message(state: &mut SubclassState, message: u32, wparam: usize) -> Option<bool> {
-    if !state.operation_in_progress {
-        return None;
-    }
-
-    if message == state.callback_message {
-        if wparam as u32 == ABN_POSCHANGED {
-            state.pending_reposition = true;
-        }
-        Some(true)
-    } else {
-        if message == WM_WINDOWPOSCHANGED {
-            state.pending_window_position_changed = true;
-        }
-        Some(false)
-    }
+    state.borrow_mut().dispatch_message(message, wparam)
 }
 
 fn detach_subclass_state(hwnd: HWND) -> Result<(), AppBarError> {
@@ -1001,14 +1075,12 @@ fn detach_subclass_state_with_api(
     hwnd: HWND,
     api: &impl WindowSubclassApi,
 ) -> Result<(), AppBarError> {
-    let state =
-        SUBCLASSED_APP_BARS.with(|app_bars| app_bars.borrow().get(&(hwnd.0 as isize)).cloned());
+    let state = registered_subclass_state(hwnd);
     let Some(state) = state else {
         return Ok(());
     };
     {
-        let state = state.borrow();
-        if !state.attached {
+        if !state.borrow().is_attached() {
             return Ok(());
         }
     }
@@ -1017,16 +1089,9 @@ fn detach_subclass_state_with_api(
     // leaving any earlier or later subclasses in the chain untouched.
     api.remove(hwnd)?;
 
-    SUBCLASSED_APP_BARS.with(|app_bars| {
-        app_bars.borrow_mut().remove(&(hwnd.0 as isize));
-    });
+    release_subclass_state(hwnd, &state);
 
-    let app_bar = {
-        let mut state = state.borrow_mut();
-        state.attached = false;
-        state.operation_in_progress = true;
-        state.app_bar.take()
-    };
+    let app_bar = state.borrow_mut().begin_detach();
 
     if let Some(mut app_bar) = app_bar {
         // The owner may outlive this state (for example after WM_CLOSE), so
@@ -1038,30 +1103,18 @@ fn detach_subclass_state_with_api(
     Ok(())
 }
 
-fn subclass_state(hwnd: HWND) -> Option<Rc<RefCell<SubclassState>>> {
-    SUBCLASSED_APP_BARS.with(|app_bars| app_bars.borrow().get(&(hwnd.0 as isize)).cloned())
+fn registered_subclass_state(hwnd: HWND) -> Option<Rc<RefCell<SubclassState>>> {
+    SUBCLASSED_APP_BARS.with(|app_bars| app_bars.borrow().state(hwnd))
 }
 
 fn begin_app_bar_operation(state: &Rc<RefCell<SubclassState>>) -> Option<AppBar> {
-    let mut state = state.borrow_mut();
-    if !state.attached || state.operation_in_progress {
-        return None;
-    }
-    let app_bar = state.app_bar.take()?;
-    state.operation_in_progress = true;
-    Some(app_bar)
+    state.borrow_mut().begin_operation()
 }
 
 fn finish_app_bar_operation(state: &Rc<RefCell<SubclassState>>, mut app_bar: AppBar) {
     loop {
-        let (reposition, position_changed, callback_message) = {
-            let mut state = state.borrow_mut();
-            (
-                std::mem::take(&mut state.pending_reposition),
-                std::mem::take(&mut state.pending_window_position_changed),
-                state.callback_message,
-            )
-        };
+        let (reposition, position_changed, callback_message) =
+            state.borrow_mut().take_pending_notifications();
 
         if !reposition && !position_changed {
             break;
@@ -1080,15 +1133,8 @@ fn finish_app_bar_operation(state: &Rc<RefCell<SubclassState>>, mut app_bar: App
         }
     }
 
-    let mut state = state.borrow_mut();
-    if state.attached {
-        state.app_bar = Some(app_bar);
-        state.operation_in_progress = false;
-    } else {
-        state.operation_in_progress = false;
-        drop(state);
-        drop(app_bar);
-    }
+    let app_bar_to_drop = state.borrow_mut().finish_operation(app_bar);
+    drop(app_bar_to_drop);
 }
 
 impl Drop for AppBar {
@@ -1482,7 +1528,8 @@ mod tests {
             Err(AppBarError::SubclassAlreadyRegistered)
         ));
 
-        let registered = subclass_state(hwnd).expect("original state remains registered");
+        let registered =
+            registered_subclass_state(hwnd).expect("original state remains registered");
         assert!(Rc::ptr_eq(&registered, &original));
         assert!(!Rc::ptr_eq(&registered, &duplicate));
         release_subclass_state(hwnd, &original);
@@ -1493,9 +1540,7 @@ mod tests {
         let hwnd = HWND::default();
         let state = subclass_state_for_test(None);
         state.borrow_mut().operation_in_progress = true;
-        SUBCLASSED_APP_BARS.with(|app_bars| {
-            app_bars.borrow_mut().insert(hwnd.0 as isize, state.clone());
-        });
+        reserve_subclass_state(hwnd, state.clone()).unwrap();
 
         let api = MockWindowSubclassApi::new(false, false);
         let error = complete_subclass_registration(
@@ -1515,7 +1560,7 @@ mod tests {
             }
         ));
         assert_eq!(*api.calls.borrow(), ["remove"]);
-        assert!(subclass_state(hwnd).is_none());
+        assert!(registered_subclass_state(hwnd).is_none());
         assert!(!state.borrow().attached);
     }
 
@@ -1524,9 +1569,7 @@ mod tests {
         let hwnd = HWND::default();
         let state = subclass_state_for_test(None);
         state.borrow_mut().operation_in_progress = true;
-        SUBCLASSED_APP_BARS.with(|app_bars| {
-            app_bars.borrow_mut().insert(hwnd.0 as isize, state.clone());
-        });
+        reserve_subclass_state(hwnd, state.clone()).unwrap();
 
         let api = MockWindowSubclassApi::new(false, true);
         let error = complete_subclass_registration(
@@ -1544,13 +1587,11 @@ mod tests {
             AppBarError::SubclassRegistrationCleanup { .. }
         ));
         assert_eq!(*api.calls.borrow(), ["remove"]);
-        assert!(subclass_state(hwnd).is_some());
+        assert!(registered_subclass_state(hwnd).is_some());
         assert!(state.borrow().attached);
         assert!(!state.borrow().operation_in_progress);
 
-        SUBCLASSED_APP_BARS.with(|app_bars| {
-            app_bars.borrow_mut().remove(&(hwnd.0 as isize));
-        });
+        release_subclass_state(hwnd, &state);
     }
 
     #[test]
@@ -1578,9 +1619,7 @@ mod tests {
     fn detach_keeps_state_when_subclass_removal_fails() {
         let hwnd = HWND::default();
         let state = subclass_state_for_test(None);
-        SUBCLASSED_APP_BARS.with(|app_bars| {
-            app_bars.borrow_mut().insert(hwnd.0 as isize, state.clone());
-        });
+        reserve_subclass_state(hwnd, state.clone()).unwrap();
 
         let api = MockWindowSubclassApi::new(false, true);
         assert!(matches!(
@@ -1589,11 +1628,9 @@ mod tests {
         ));
         assert_eq!(*api.calls.borrow(), ["remove"]);
         assert!(state.borrow().attached);
-        assert!(subclass_state(hwnd).is_some());
+        assert!(registered_subclass_state(hwnd).is_some());
 
-        SUBCLASSED_APP_BARS.with(|app_bars| {
-            app_bars.borrow_mut().remove(&(hwnd.0 as isize));
-        });
+        release_subclass_state(hwnd, &state);
     }
 
     #[test]
@@ -1601,9 +1638,7 @@ mod tests {
         let hwnd = HWND::default();
         let app_bar_api = Rc::new(MockAppBarApi::new(RECT::default(), false));
         let state = subclass_state_for_test(Some(app_bar_for_test(app_bar_api.clone())));
-        SUBCLASSED_APP_BARS.with(|app_bars| {
-            app_bars.borrow_mut().insert(hwnd.0 as isize, state.clone());
-        });
+        reserve_subclass_state(hwnd, state.clone()).unwrap();
 
         let api = MockWindowSubclassApi::new(false, false);
         detach_subclass_state_with_api(hwnd, &api).unwrap();
@@ -1611,7 +1646,7 @@ mod tests {
         assert_eq!(*api.calls.borrow(), ["remove"]);
         assert!(!state.borrow().attached);
         assert!(state.borrow().app_bar.is_none());
-        assert!(subclass_state(hwnd).is_none());
+        assert!(registered_subclass_state(hwnd).is_none());
         assert!(
             app_bar_api
                 .messages
@@ -1688,15 +1723,11 @@ mod tests {
         {
             let mut state = state.borrow_mut();
             assert_eq!(
-                defer_reentrant_message(
-                    &mut state,
-                    APP_BAR_CALLBACK_MESSAGE,
-                    ABN_POSCHANGED as usize,
-                ),
+                state.defer_reentrant_message(APP_BAR_CALLBACK_MESSAGE, ABN_POSCHANGED as usize),
                 Some(true)
             );
             assert_eq!(
-                defer_reentrant_message(&mut state, WM_WINDOWPOSCHANGED, 0),
+                state.defer_reentrant_message(WM_WINDOWPOSCHANGED, 0),
                 Some(false)
             );
         }
