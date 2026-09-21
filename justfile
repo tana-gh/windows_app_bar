@@ -16,4 +16,7 @@ test:
 example-basic:
     cargo run -p windows_app_bar_example_basic
 
+example-bevy:
+    cargo run -p windows_app_bar_example_bevy
+
 check-all: format lint test

@@ -8,7 +8,7 @@ description = "Windows AppBar API"
 
 [workspace]
 resolver = "2"
-members = ["core", "examples/basic"]
+members = ["core", "examples/basic", "examples/bevy"]
 
 [workspace.dependencies]
 log = "0.4"
