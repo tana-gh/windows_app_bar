@@ -525,13 +525,8 @@ impl AppBar {
             return Err(AppBarError::InvalidSize);
         }
 
-        let handle = window.window_handle().map_err(AppBarError::WindowHandle)?;
-        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
-            return Err(AppBarError::NotAWin32Window);
-        };
-
         let mut app_bar = Self {
-            hwnd: HWND(handle.hwnd.get() as *mut c_void),
+            hwnd: hwnd_from_window(window)?,
             monitor_index,
             edge,
             size,
@@ -1157,7 +1152,7 @@ mod tests {
         sync::{Mutex, Once},
     };
 
-    use raw_window_handle::{Win32WindowHandle, WindowHandle};
+    use raw_window_handle::{WebWindowHandle, Win32WindowHandle, WindowHandle};
     use windows::{
         Win32::{
             System::LibraryLoader::GetModuleHandleW,
@@ -1182,6 +1177,20 @@ mod tests {
             // The test keeps the native window alive for the lifetime of this
             // borrowing wrapper.
             unsafe { Ok(WindowHandle::borrow_raw(RawWindowHandle::Win32(handle))) }
+        }
+    }
+
+    struct NonWin32TestWindow;
+
+    impl HasWindowHandle for NonWin32TestWindow {
+        fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+            // This synthetic handle is used only to exercise the platform
+            // validation path; it is never passed to a native API.
+            unsafe {
+                Ok(WindowHandle::borrow_raw(RawWindowHandle::Web(
+                    WebWindowHandle::new(0),
+                )))
+            }
         }
     }
 
@@ -1489,6 +1498,17 @@ mod tests {
             Err(AppBarError::MonitorNotFound { index: 1 })
         ));
         assert_eq!(app_bar.monitor_index(), 0);
+    }
+
+    #[test]
+    fn hwnd_from_window_accepts_win32_handles_and_rejects_other_platforms() {
+        let window = TestWindow(HWND(std::ptr::dangling_mut::<c_void>()));
+        assert_eq!(hwnd_from_window(&window).unwrap(), window.0);
+
+        assert!(matches!(
+            hwnd_from_window(&NonWin32TestWindow),
+            Err(AppBarError::NotAWin32Window)
+        ));
     }
 
     #[test]
