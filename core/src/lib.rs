@@ -622,18 +622,8 @@ unsafe extern "system" fn subclassed_app_bar_window_proc(
     };
     let (app_bar, consumed) = {
         let mut state = state.borrow_mut();
-        if state.operation_in_progress {
-            if message == state.callback_message {
-                if wparam.0 as u32 == ABN_POSCHANGED {
-                    state.pending_reposition = true;
-                }
-                (None, true)
-            } else {
-                if message == WM_WINDOWPOSCHANGED {
-                    state.pending_window_position_changed = true;
-                }
-                (None, false)
-            }
+        if let Some(consumed) = defer_reentrant_message(&mut state, message, wparam.0) {
+            (None, consumed)
         } else {
             let app_bar = state.app_bar.take();
             state.operation_in_progress = app_bar.is_some();
@@ -661,6 +651,26 @@ unsafe extern "system" fn subclassed_app_bar_window_proc(
         LRESULT(0)
     } else {
         call_next_subclass(hwnd, message, wparam, lparam)
+    }
+}
+
+/// Records AppBar-relevant messages received while the AppBar is temporarily
+/// unavailable, returning whether the message is consumed in that case.
+fn defer_reentrant_message(state: &mut SubclassState, message: u32, wparam: usize) -> Option<bool> {
+    if !state.operation_in_progress {
+        return None;
+    }
+
+    if message == state.callback_message {
+        if wparam as u32 == ABN_POSCHANGED {
+            state.pending_reposition = true;
+        }
+        Some(true)
+    } else {
+        if message == WM_WINDOWPOSCHANGED {
+            state.pending_window_position_changed = true;
+        }
+        Some(false)
     }
 }
 
@@ -945,6 +955,58 @@ mod tests {
         assert!(!state.operation_in_progress);
         assert!(!state.pending_reposition);
         assert!(!state.pending_window_position_changed);
+        drop(state);
+
+        let messages = api.messages.borrow();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].0, ABM_QUERYPOS);
+        assert_eq!(messages[1].0, ABM_SETPOS);
+        assert_eq!(messages[2].0, ABM_WINDOWPOSCHANGED);
+    }
+
+    #[test]
+    fn registration_time_callbacks_are_deferred_and_replayed() {
+        let api = Rc::new(MockAppBarApi::new(
+            RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            false,
+        ));
+        let state = Rc::new(RefCell::new(SubclassState {
+            // This is the state between installing the window subclass and
+            // completing AppBar::register_with_callback_message.
+            app_bar: None,
+            callback_message: APP_BAR_CALLBACK_MESSAGE,
+            attached: true,
+            operation_in_progress: true,
+            pending_reposition: false,
+            pending_window_position_changed: false,
+        }));
+
+        {
+            let mut state = state.borrow_mut();
+            assert_eq!(
+                defer_reentrant_message(
+                    &mut state,
+                    APP_BAR_CALLBACK_MESSAGE,
+                    ABN_POSCHANGED as usize,
+                ),
+                Some(true)
+            );
+            assert_eq!(
+                defer_reentrant_message(&mut state, WM_WINDOWPOSCHANGED, 0),
+                Some(false)
+            );
+        }
+
+        finish_app_bar_operation(&state, app_bar_for_test(api.clone()));
+
+        let state = state.borrow();
+        assert!(state.app_bar.is_some());
+        assert!(!state.operation_in_progress);
         drop(state);
 
         let messages = api.messages.borrow();
