@@ -10,8 +10,6 @@ publish = false
 
 [dependencies]
 bevy = "0.19.1"
-raw-window-handle.workspace = true
-windows.workspace = true
 windows_app_bar = { path = "../../core" }
 
 # Enable a small amount of optimization in the dev profile.
