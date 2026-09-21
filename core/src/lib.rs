@@ -13,8 +13,7 @@ use std::{
     ffi::c_void,
     marker::PhantomData,
     mem::{size_of, transmute},
-    ptr::NonNull,
-    rc::Rc,
+    rc::{Rc, Weak},
 };
 
 use log::debug;
@@ -136,14 +135,16 @@ pub struct AppBar {
 }
 
 thread_local! {
-    static SUBCLASSED_APP_BARS: RefCell<HashMap<isize, SubclassState>> = RefCell::new(HashMap::new());
+    static SUBCLASSED_APP_BARS: RefCell<HashMap<isize, Weak<RefCell<SubclassState>>>> = RefCell::new(HashMap::new());
 }
 
 #[derive(Debug)]
 struct SubclassState {
-    app_bar: Option<NonNull<AppBar>>,
+    app_bar: Option<AppBar>,
     previous_wnd_proc: WNDPROC,
-    handling_message: bool,
+    callback_message: u32,
+    operation_in_progress: bool,
+    pending_reposition: bool,
     pending_window_position_changed: bool,
 }
 
@@ -155,7 +156,7 @@ struct SubclassState {
 #[derive(Debug)]
 pub struct SubclassedAppBar {
     hwnd: HWND,
-    app_bar: Box<AppBar>,
+    state: Rc<RefCell<SubclassState>>,
     _thread_affinity: PhantomData<Rc<()>>,
 }
 
@@ -444,51 +445,106 @@ impl SubclassedAppBar {
         };
         let previous_wnd_proc = unsafe { transmute::<isize, WNDPROC>(previous_wnd_proc) };
 
+        let state = Rc::new(RefCell::new(SubclassState {
+            app_bar: None,
+            previous_wnd_proc,
+            callback_message,
+            // Shell calls made during registration may synchronously enter the
+            // WndProc. Queue their relevant notifications until `app_bar` is
+            // available below.
+            operation_in_progress: true,
+            pending_reposition: false,
+            pending_window_position_changed: false,
+        }));
         SUBCLASSED_APP_BARS.with(|app_bars| {
-            app_bars.borrow_mut().insert(
-                hwnd.0 as isize,
-                SubclassState {
-                    app_bar: None,
-                    previous_wnd_proc,
-                    handling_message: false,
-                    pending_window_position_changed: false,
-                },
-            );
+            app_bars
+                .borrow_mut()
+                .insert(hwnd.0 as isize, Rc::downgrade(&state));
         });
 
         let app_bar =
             match AppBar::register_with_callback_message(window, edge, size, callback_message) {
-                Ok(app_bar) => Box::new(app_bar),
+                Ok(app_bar) => app_bar,
                 Err(error) => {
                     remove_subclass_state(hwnd, true);
                     return Err(error);
                 }
             };
-        let app_bar_ptr = NonNull::from(&*app_bar);
-
-        SUBCLASSED_APP_BARS.with(|app_bars| {
-            let mut app_bars = app_bars.borrow_mut();
-            let state = app_bars
-                .get_mut(&(hwnd.0 as isize))
-                .expect("AppBar subclass state was installed");
-            state.app_bar = Some(app_bar_ptr);
-        });
+        finish_app_bar_operation(&state, app_bar);
 
         Ok(Self {
             hwnd,
-            app_bar,
+            state,
             _thread_affinity: PhantomData,
         })
     }
 
-    /// Returns the registered AppBar.
-    pub const fn app_bar(&self) -> &AppBar {
-        &self.app_bar
+    /// Returns the edge currently requested by this AppBar.
+    pub fn edge(&self) -> Edge {
+        self.state
+            .borrow()
+            .app_bar
+            .as_ref()
+            .expect("AppBar is available outside an operation")
+            .edge()
     }
 
-    /// Returns the registered AppBar mutably.
-    pub fn app_bar_mut(&mut self) -> &mut AppBar {
-        &mut self.app_bar
+    /// Returns this AppBar's requested thickness in physical pixels.
+    pub fn size(&self) -> u32 {
+        self.state
+            .borrow()
+            .app_bar
+            .as_ref()
+            .expect("AppBar is available outside an operation")
+            .size()
+    }
+
+    /// Returns the Shell callback message registered for this AppBar.
+    pub fn callback_message(&self) -> u32 {
+        self.state.borrow().callback_message
+    }
+
+    /// Returns whether this AppBar currently reserves desktop work area.
+    pub fn is_visible(&self) -> bool {
+        self.state
+            .borrow()
+            .app_bar
+            .as_ref()
+            .expect("AppBar is available outside an operation")
+            .is_visible()
+    }
+
+    /// Changes the requested thickness and immediately repositions the AppBar.
+    pub fn set_size(&mut self, size: u32) -> Result<(), AppBarError> {
+        self.with_app_bar(|app_bar| app_bar.set_size(size))
+    }
+
+    /// Changes the desktop edge and immediately repositions the AppBar.
+    pub fn set_edge(&mut self, edge: Edge) -> Result<(), AppBarError> {
+        self.with_app_bar(|app_bar| app_bar.set_edge(edge))
+    }
+
+    /// Shows the AppBar and reserves its desktop work area.
+    pub fn show(&mut self) -> Result<(), AppBarError> {
+        self.with_app_bar(AppBar::show)
+    }
+
+    /// Hides the AppBar and releases its desktop work area.
+    pub fn hide(&mut self) -> Result<(), AppBarError> {
+        self.with_app_bar(AppBar::hide)
+    }
+
+    /// Runs `operation` with the registered AppBar.
+    ///
+    /// Any AppBar notifications synchronously re-entered while `operation`
+    /// calls Win32 are deferred and processed before this method returns.
+    pub fn with_app_bar<R>(&mut self, operation: impl FnOnce(&mut AppBar) -> R) -> R {
+        let app_bar = begin_app_bar_operation(&self.state)
+            .expect("an AppBar operation cannot be nested on the same instance");
+        let mut app_bar = app_bar;
+        let result = operation(&mut app_bar);
+        finish_app_bar_operation(&self.state, app_bar);
+        result
     }
 }
 
@@ -517,33 +573,37 @@ unsafe extern "system" fn subclassed_app_bar_window_proc(
         return call_previous_wnd_proc(previous_wnd_proc, hwnd, message, wparam, lparam);
     }
 
-    let (app_bar, previous_wnd_proc, already_handling) = SUBCLASSED_APP_BARS.with(|app_bars| {
-        let mut app_bars = app_bars.borrow_mut();
-        let Some(state) = app_bars.get_mut(&(hwnd.0 as isize)) else {
-            return (None, None, false);
-        };
-
-        if state.handling_message {
-            if message == WM_WINDOWPOSCHANGED {
-                state.pending_window_position_changed = true;
+    let Some(state) = subclass_state(hwnd) else {
+        return LRESULT(0);
+    };
+    let (app_bar, previous_wnd_proc, consumed) = {
+        let mut state = state.borrow_mut();
+        let previous_wnd_proc = state.previous_wnd_proc;
+        if state.operation_in_progress {
+            if message == state.callback_message {
+                if wparam.0 as u32 == ABN_POSCHANGED {
+                    state.pending_reposition = true;
+                }
+                (None, previous_wnd_proc, true)
+            } else {
+                if message == WM_WINDOWPOSCHANGED {
+                    state.pending_window_position_changed = true;
+                }
+                (None, previous_wnd_proc, false)
             }
-            return (None, state.previous_wnd_proc, true);
+        } else {
+            let app_bar = state.app_bar.take();
+            state.operation_in_progress = app_bar.is_some();
+            (app_bar, previous_wnd_proc, false)
         }
+    };
 
-        let Some(app_bar) = state.app_bar else {
-            return (None, state.previous_wnd_proc, false);
-        };
-        state.handling_message = true;
-        (Some(app_bar), state.previous_wnd_proc, false)
-    });
-
-    if already_handling || app_bar.is_none() {
-        return call_previous_wnd_proc(previous_wnd_proc, hwnd, message, wparam, lparam);
+    if consumed {
+        return LRESULT(0);
     }
-
-    // The AppBar is heap allocated by SubclassedAppBar and its address remains
-    // stable until the subclass state is removed.
-    let app_bar = unsafe { &mut *app_bar.expect("checked above").as_ptr() };
+    let Some(mut app_bar) = app_bar else {
+        return call_previous_wnd_proc(previous_wnd_proc, hwnd, message, wparam, lparam);
+    };
     let consumed = match app_bar.handle_window_message(message, wparam.0, lparam.0) {
         Ok(consumed) => consumed,
         Err(error) => {
@@ -552,20 +612,7 @@ unsafe extern "system" fn subclassed_app_bar_window_proc(
         }
     };
 
-    let notify_position_changed = SUBCLASSED_APP_BARS.with(|app_bars| {
-        let mut app_bars = app_bars.borrow_mut();
-        let Some(state) = app_bars.get_mut(&(hwnd.0 as isize)) else {
-            return false;
-        };
-        state.handling_message = false;
-        std::mem::take(&mut state.pending_window_position_changed)
-    });
-
-    if notify_position_changed
-        && let Err(error) = app_bar.handle_window_message(WM_WINDOWPOSCHANGED, 0, 0)
-    {
-        debug!("AppBar position notification failed: {error}");
-    }
+    finish_app_bar_operation(&state, app_bar);
 
     if consumed {
         LRESULT(0)
@@ -575,29 +622,88 @@ unsafe extern "system" fn subclassed_app_bar_window_proc(
 }
 
 fn remove_subclass_state(hwnd: HWND, restore_wnd_proc: bool) -> WNDPROC {
-    let state =
-        SUBCLASSED_APP_BARS.with(|app_bars| app_bars.borrow_mut().remove(&(hwnd.0 as isize)));
-    let state = state?;
+    let state = SUBCLASSED_APP_BARS
+        .with(|app_bars| app_bars.borrow_mut().remove(&(hwnd.0 as isize)))?
+        .upgrade()?;
+    let (previous_wnd_proc, app_bar) = {
+        let mut state = state.borrow_mut();
+        state.operation_in_progress = true;
+        (state.previous_wnd_proc, state.app_bar.take())
+    };
 
     if restore_wnd_proc {
         unsafe {
             SetWindowLongPtrW(
                 hwnd,
                 GWLP_WNDPROC,
-                transmute::<WNDPROC, isize>(state.previous_wnd_proc),
+                transmute::<WNDPROC, isize>(previous_wnd_proc),
             );
         }
     }
 
-    if let Some(mut app_bar) = state.app_bar {
+    if let Some(mut app_bar) = app_bar {
         // The owner may outlive this state (for example after WM_CLOSE), so
         // mark it unregistered before its HWND can be destroyed.
-        if let Err(error) = unsafe { app_bar.as_mut() }.remove() {
+        if let Err(error) = app_bar.remove() {
             debug!("failed to remove AppBar during window teardown: {error}");
         }
     }
 
-    state.previous_wnd_proc
+    previous_wnd_proc
+}
+
+fn subclass_state(hwnd: HWND) -> Option<Rc<RefCell<SubclassState>>> {
+    SUBCLASSED_APP_BARS.with(|app_bars| {
+        let mut app_bars = app_bars.borrow_mut();
+        let state = app_bars.get(&(hwnd.0 as isize))?.upgrade();
+        if state.is_none() {
+            app_bars.remove(&(hwnd.0 as isize));
+        }
+        state
+    })
+}
+
+fn begin_app_bar_operation(state: &Rc<RefCell<SubclassState>>) -> Option<AppBar> {
+    let mut state = state.borrow_mut();
+    if state.operation_in_progress {
+        return None;
+    }
+    let app_bar = state.app_bar.take()?;
+    state.operation_in_progress = true;
+    Some(app_bar)
+}
+
+fn finish_app_bar_operation(state: &Rc<RefCell<SubclassState>>, mut app_bar: AppBar) {
+    loop {
+        let (reposition, position_changed, callback_message) = {
+            let mut state = state.borrow_mut();
+            (
+                std::mem::take(&mut state.pending_reposition),
+                std::mem::take(&mut state.pending_window_position_changed),
+                state.callback_message,
+            )
+        };
+
+        if !reposition && !position_changed {
+            break;
+        }
+
+        if reposition
+            && let Err(error) =
+                app_bar.handle_window_message(callback_message, ABN_POSCHANGED as usize, 0)
+        {
+            debug!("deferred AppBar reposition failed: {error}");
+        }
+        if position_changed
+            && let Err(error) = app_bar.handle_window_message(WM_WINDOWPOSCHANGED, 0, 0)
+        {
+            debug!("deferred AppBar position notification failed: {error}");
+        }
+    }
+
+    let mut state = state.borrow_mut();
+    state.app_bar = Some(app_bar);
+    state.operation_in_progress = false;
 }
 
 fn call_previous_wnd_proc(
@@ -758,5 +864,47 @@ mod tests {
 
         assert!(app_bar.set_edge(Edge::Left).is_err());
         assert_eq!(app_bar.edge(), Edge::Bottom);
+    }
+
+    #[test]
+    fn deferred_subclass_notifications_are_drained_after_an_operation() {
+        let api = Rc::new(MockAppBarApi::new(
+            RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            false,
+        ));
+        let state = Rc::new(RefCell::new(SubclassState {
+            app_bar: Some(app_bar_for_test(api.clone())),
+            previous_wnd_proc: None,
+            callback_message: APP_BAR_CALLBACK_MESSAGE,
+            operation_in_progress: false,
+            pending_reposition: false,
+            pending_window_position_changed: false,
+        }));
+
+        let app_bar = begin_app_bar_operation(&state).unwrap();
+        {
+            let mut state = state.borrow_mut();
+            state.pending_reposition = true;
+            state.pending_window_position_changed = true;
+        }
+        finish_app_bar_operation(&state, app_bar);
+
+        let state = state.borrow();
+        assert!(state.app_bar.is_some());
+        assert!(!state.operation_in_progress);
+        assert!(!state.pending_reposition);
+        assert!(!state.pending_window_position_changed);
+        drop(state);
+
+        let messages = api.messages.borrow();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].0, ABM_QUERYPOS);
+        assert_eq!(messages[1].0, ABM_SETPOS);
+        assert_eq!(messages[2].0, ABM_WINDOWPOSCHANGED);
     }
 }
