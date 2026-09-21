@@ -4,7 +4,6 @@ edition = "2024"
 authors = ["tana-gh"]
 license = "No License"
 repository = "https://github.com/tana-gh/windows_app_bar.git"
-description = "Windows AppBar API"
 
 [workspace]
 resolver = "2"
