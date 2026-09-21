@@ -38,6 +38,49 @@ pub const APP_BAR_CALLBACK_MESSAGE: u32 = WM_APP + 0x3a0;
 
 const APP_BAR_SUBCLASS_ID: usize = 0x77_41_42_00;
 
+/// Win32 operations performed by the window-subclass lifecycle.
+///
+/// Keeping these calls behind a narrow boundary lets the state transitions be
+/// tested without a real HWND. The callback itself always uses
+/// `WindowsWindowSubclassApi`.
+trait WindowSubclassApi: std::fmt::Debug {
+    fn install(&self, hwnd: HWND) -> windows::core::Result<()>;
+    fn remove(&self, hwnd: HWND) -> windows::core::Result<()>;
+    fn call_next(&self, hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT;
+}
+
+#[derive(Debug)]
+struct WindowsWindowSubclassApi;
+
+impl WindowSubclassApi for WindowsWindowSubclassApi {
+    fn install(&self, hwnd: HWND) -> windows::core::Result<()> {
+        unsafe {
+            SetWindowSubclass(
+                hwnd,
+                Some(subclassed_app_bar_window_proc),
+                APP_BAR_SUBCLASS_ID,
+                0,
+            )
+            .ok()
+        }
+    }
+
+    fn remove(&self, hwnd: HWND) -> windows::core::Result<()> {
+        unsafe {
+            RemoveWindowSubclass(
+                hwnd,
+                Some(subclassed_app_bar_window_proc),
+                APP_BAR_SUBCLASS_ID,
+            )
+            .ok()
+        }
+    }
+
+    fn call_next(&self, hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+    }
+}
+
 /// The desktop edge occupied by an AppBar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Edge {
@@ -246,6 +289,14 @@ struct SubclassState {
     operation_in_progress: bool,
     pending_reposition: bool,
     pending_window_position_changed: bool,
+}
+
+/// The action the WndProc must take after inspecting one message.
+#[derive(Debug)]
+enum SubclassMessageDispatch {
+    Consume,
+    Forward,
+    HandleWithAppBar(AppBar),
 }
 
 /// An [`AppBar`] which automatically forwards its owner window's messages.
@@ -601,39 +652,25 @@ impl SubclassedAppBar {
         SUBCLASSED_APP_BARS.with(|app_bars| {
             app_bars.borrow_mut().insert(hwnd.0 as isize, state.clone());
         });
-        if let Err(error) = install_window_subclass(hwnd) {
+        if let Err(error) = install_window_subclass_with_api(hwnd, &WindowsWindowSubclassApi) {
             SUBCLASSED_APP_BARS.with(|app_bars| {
                 app_bars.borrow_mut().remove(&(hwnd.0 as isize));
             });
             return Err(error);
         }
 
-        let app_bar = match AppBar::register_with_callback_message(
-            window,
-            monitor_index,
-            edge,
-            size,
-            callback_message,
-        ) {
-            Ok(app_bar) => app_bar,
-            Err(error) => {
-                let rollback = detach_subclass_state(hwnd);
-                return match rollback {
-                    Ok(()) => Err(error),
-                    Err(AppBarError::Windows(restore_error)) => {
-                        let mut state = state.borrow_mut();
-                        state.operation_in_progress = false;
-                        state.pending_reposition = false;
-                        state.pending_window_position_changed = false;
-                        Err(AppBarError::SubclassRegistrationCleanup {
-                            registration_error: Box::new(error),
-                            subclass_error: restore_error,
-                        })
-                    }
-                    Err(rollback_error) => Err(rollback_error),
-                };
-            }
-        };
+        let app_bar = complete_subclass_registration(
+            hwnd,
+            &state,
+            AppBar::register_with_callback_message(
+                window,
+                monitor_index,
+                edge,
+                size,
+                callback_message,
+            ),
+            &WindowsWindowSubclassApi,
+        )?;
         finish_app_bar_operation(&state, app_bar);
 
         Ok(Self {
@@ -718,7 +755,7 @@ impl SubclassedAppBar {
     /// Call this before destroying the native window so cleanup errors can be
     /// reported to the caller.
     pub fn unregister(self) -> Result<(), AppBarError> {
-        detach_subclass_state(self.hwnd)
+        detach_subclass_state_with_api(self.hwnd, &WindowsWindowSubclassApi)
     }
 
     /// Runs `operation` with the registered AppBar.
@@ -751,17 +788,41 @@ fn hwnd_from_window(window: &impl HasWindowHandle) -> Result<HWND, AppBarError> 
     Ok(HWND(handle.hwnd.get() as *mut c_void))
 }
 
-fn install_window_subclass(hwnd: HWND) -> Result<(), AppBarError> {
-    unsafe {
-        SetWindowSubclass(
-            hwnd,
-            Some(subclassed_app_bar_window_proc),
-            APP_BAR_SUBCLASS_ID,
-            0,
-        )
-        .ok()?;
-    }
+fn install_window_subclass_with_api(
+    hwnd: HWND,
+    api: &impl WindowSubclassApi,
+) -> Result<(), AppBarError> {
+    api.install(hwnd)?;
     Ok(())
+}
+
+/// Completes AppBar registration after the window subclass has been installed.
+///
+/// Keeping this rollback path independent from Win32 lets failure handling be
+/// tested with a mock subclass API.
+fn complete_subclass_registration(
+    hwnd: HWND,
+    state: &Rc<RefCell<SubclassState>>,
+    app_bar: Result<AppBar, AppBarError>,
+    api: &impl WindowSubclassApi,
+) -> Result<AppBar, AppBarError> {
+    match app_bar {
+        Ok(app_bar) => Ok(app_bar),
+        Err(error) => match detach_subclass_state_with_api(hwnd, api) {
+            Ok(()) => Err(error),
+            Err(AppBarError::Windows(subclass_error)) => {
+                let mut state = state.borrow_mut();
+                state.operation_in_progress = false;
+                state.pending_reposition = false;
+                state.pending_window_position_changed = false;
+                Err(AppBarError::SubclassRegistrationCleanup {
+                    registration_error: Box::new(error),
+                    subclass_error,
+                })
+            }
+            Err(rollback_error) => Err(rollback_error),
+        },
+    }
 }
 
 unsafe extern "system" fn subclassed_app_bar_window_proc(
@@ -772,32 +833,21 @@ unsafe extern "system" fn subclassed_app_bar_window_proc(
     _subclass_id: usize,
     _reference_data: usize,
 ) -> LRESULT {
+    let api = WindowsWindowSubclassApi;
     if message == WM_DESTROY {
-        if let Err(error) = detach_subclass_state(hwnd) {
+        if let Err(error) = detach_subclass_state_with_api(hwnd, &api) {
             debug!("failed to detach AppBar during window destruction: {error}");
         }
-        return call_next_subclass(hwnd, message, wparam, lparam);
+        return api.call_next(hwnd, message, wparam, lparam);
     }
 
     let Some(state) = subclass_state(hwnd) else {
         return LRESULT(0);
     };
-    let (app_bar, consumed) = {
-        let mut state = state.borrow_mut();
-        if let Some(consumed) = defer_reentrant_message(&mut state, message, wparam.0) {
-            (None, consumed)
-        } else {
-            let app_bar = state.app_bar.take();
-            state.operation_in_progress = app_bar.is_some();
-            (app_bar, false)
-        }
-    };
-
-    if consumed {
-        return LRESULT(0);
-    }
-    let Some(mut app_bar) = app_bar else {
-        return call_next_subclass(hwnd, message, wparam, lparam);
+    let mut app_bar = match dispatch_subclass_message(&state, message, wparam.0) {
+        SubclassMessageDispatch::Consume => return LRESULT(0),
+        SubclassMessageDispatch::Forward => return api.call_next(hwnd, message, wparam, lparam),
+        SubclassMessageDispatch::HandleWithAppBar(app_bar) => app_bar,
     };
     let consumed = match app_bar.handle_window_message(message, wparam.0, lparam.0) {
         Ok(consumed) => consumed,
@@ -812,8 +862,30 @@ unsafe extern "system" fn subclassed_app_bar_window_proc(
     if consumed {
         LRESULT(0)
     } else {
-        call_next_subclass(hwnd, message, wparam, lparam)
+        api.call_next(hwnd, message, wparam, lparam)
     }
+}
+
+/// Chooses the WndProc action and performs only in-memory state transitions.
+fn dispatch_subclass_message(
+    state: &Rc<RefCell<SubclassState>>,
+    message: u32,
+    wparam: usize,
+) -> SubclassMessageDispatch {
+    let mut state = state.borrow_mut();
+    if let Some(consumed) = defer_reentrant_message(&mut state, message, wparam) {
+        return if consumed {
+            SubclassMessageDispatch::Consume
+        } else {
+            SubclassMessageDispatch::Forward
+        };
+    }
+
+    let Some(app_bar) = state.app_bar.take() else {
+        return SubclassMessageDispatch::Forward;
+    };
+    state.operation_in_progress = true;
+    SubclassMessageDispatch::HandleWithAppBar(app_bar)
 }
 
 /// Records AppBar-relevant messages received while the AppBar is temporarily
@@ -837,6 +909,13 @@ fn defer_reentrant_message(state: &mut SubclassState, message: u32, wparam: usiz
 }
 
 fn detach_subclass_state(hwnd: HWND) -> Result<(), AppBarError> {
+    detach_subclass_state_with_api(hwnd, &WindowsWindowSubclassApi)
+}
+
+fn detach_subclass_state_with_api(
+    hwnd: HWND,
+    api: &impl WindowSubclassApi,
+) -> Result<(), AppBarError> {
     let state =
         SUBCLASSED_APP_BARS.with(|app_bars| app_bars.borrow().get(&(hwnd.0 as isize)).cloned());
     let Some(state) = state else {
@@ -849,16 +928,9 @@ fn detach_subclass_state(hwnd: HWND) -> Result<(), AppBarError> {
         }
     }
 
-    unsafe {
-        // This removes only the callback identified by our procedure and ID,
-        // leaving any earlier or later subclasses in the chain untouched.
-        RemoveWindowSubclass(
-            hwnd,
-            Some(subclassed_app_bar_window_proc),
-            APP_BAR_SUBCLASS_ID,
-        )
-        .ok()?;
-    }
+    // This removes only the callback identified by our procedure and ID,
+    // leaving any earlier or later subclasses in the chain untouched.
+    api.remove(hwnd)?;
 
     SUBCLASSED_APP_BARS.with(|app_bars| {
         app_bars.borrow_mut().remove(&(hwnd.0 as isize));
@@ -934,10 +1006,6 @@ fn finish_app_bar_operation(state: &Rc<RefCell<SubclassState>>, mut app_bar: App
     }
 }
 
-fn call_next_subclass(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
-}
-
 impl Drop for AppBar {
     fn drop(&mut self) {
         if self.registered
@@ -951,7 +1019,104 @@ impl Drop for AppBar {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::RefCell,
+        num::NonZeroIsize,
+        rc::Rc,
+        sync::{Mutex, Once},
+    };
+
+    use raw_window_handle::{Win32WindowHandle, WindowHandle};
+    use windows::{
+        Win32::{
+            System::LibraryLoader::GetModuleHandleW,
+            UI::WindowsAndMessaging::{
+                CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW,
+                HMENU, RegisterClassW, SendMessageW, SetWindowLongPtrW, WINDOW_EX_STYLE, WM_CLOSE,
+                WNDCLASSW, WS_POPUP,
+            },
+        },
+        core::w,
+    };
+
+    const INTEGRATION_TEST_CLASS: windows::core::PCWSTR = w!("windows_app_bar_integration_test");
+    static INTERACTIVE_DESKTOP: Mutex<()> = Mutex::new(());
+
+    struct TestWindow(HWND);
+
+    impl HasWindowHandle for TestWindow {
+        fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+            let hwnd = NonZeroIsize::new(self.0.0 as isize).ok_or(HandleError::Unavailable)?;
+            let handle = Win32WindowHandle::new(hwnd);
+            // The test keeps the native window alive for the lifetime of this
+            // borrowing wrapper.
+            unsafe { Ok(WindowHandle::borrow_raw(RawWindowHandle::Win32(handle))) }
+        }
+    }
+
+    unsafe extern "system" fn integration_test_window_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if message == WM_CLOSE {
+            let close_count = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut usize;
+            if !close_count.is_null() {
+                unsafe { *close_count += 1 };
+            }
+            return LRESULT(0);
+        }
+        unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+    }
+
+    fn create_integration_test_window() -> TestWindow {
+        static CLASS: Once = Once::new();
+        CLASS.call_once(|| unsafe {
+            let instance = GetModuleHandleW(None).expect("get test module handle");
+            let class = WNDCLASSW {
+                hInstance: instance.into(),
+                lpszClassName: INTEGRATION_TEST_CLASS,
+                lpfnWndProc: Some(integration_test_window_proc),
+                ..Default::default()
+            };
+            assert_ne!(RegisterClassW(&class), 0, "register test window class");
+        });
+
+        unsafe {
+            let instance = GetModuleHandleW(None).expect("get test module handle");
+            TestWindow(
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    INTEGRATION_TEST_CLASS,
+                    w!("windows_app_bar integration test"),
+                    WS_POPUP,
+                    0,
+                    0,
+                    1,
+                    1,
+                    None,
+                    Some(HMENU::default()),
+                    Some(instance.into()),
+                    None,
+                )
+                .expect("create test window"),
+            )
+        }
+    }
+
+    fn try_register_integration_app_bar(window: &TestWindow) -> Option<SubclassedAppBar> {
+        match SubclassedAppBar::register(window, 0, Edge::Bottom, 1) {
+            Ok(app_bar) => Some(app_bar),
+            Err(AppBarError::ShellOperationFailed {
+                operation: "registration",
+            }) => {
+                eprintln!("skipping: the current desktop does not provide a Shell AppBar host");
+                None
+            }
+            Err(error) => panic!("register AppBar on the primary enumerated monitor: {error}"),
+        }
+    }
 
     #[derive(Debug)]
     struct MockAppBarApi {
@@ -1003,6 +1168,61 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct MockWindowSubclassApi {
+        calls: RefCell<Vec<&'static str>>,
+        fail_install: bool,
+        fail_remove: bool,
+    }
+
+    impl MockWindowSubclassApi {
+        fn new(fail_install: bool, fail_remove: bool) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                fail_install,
+                fail_remove,
+            }
+        }
+
+        fn failure() -> windows::core::Error {
+            windows::core::Error::new(
+                windows::core::HRESULT(0x8000_4005u32 as i32),
+                "mock window subclass failure",
+            )
+        }
+    }
+
+    impl WindowSubclassApi for MockWindowSubclassApi {
+        fn install(&self, _hwnd: HWND) -> windows::core::Result<()> {
+            self.calls.borrow_mut().push("install");
+            if self.fail_install {
+                Err(Self::failure())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn remove(&self, _hwnd: HWND) -> windows::core::Result<()> {
+            self.calls.borrow_mut().push("remove");
+            if self.fail_remove {
+                Err(Self::failure())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn call_next(
+            &self,
+            _hwnd: HWND,
+            _message: u32,
+            _wparam: WPARAM,
+            _lparam: LPARAM,
+        ) -> LRESULT {
+            self.calls.borrow_mut().push("call_next");
+            LRESULT(123)
+        }
+    }
+
     fn app_bar_for_test(api: Rc<MockAppBarApi>) -> AppBar {
         AppBar {
             hwnd: HWND::default(),
@@ -1014,6 +1234,17 @@ mod tests {
             api: Box::new(api),
             _thread_affinity: PhantomData,
         }
+    }
+
+    fn subclass_state_for_test(app_bar: Option<AppBar>) -> Rc<RefCell<SubclassState>> {
+        Rc::new(RefCell::new(SubclassState {
+            app_bar,
+            callback_message: APP_BAR_CALLBACK_MESSAGE,
+            attached: true,
+            operation_in_progress: false,
+            pending_reposition: false,
+            pending_window_position_changed: false,
+        }))
     }
 
     #[test]
@@ -1130,6 +1361,154 @@ mod tests {
     }
 
     #[test]
+    fn subclass_installation_is_testable_without_a_real_window() {
+        let hwnd = HWND::default();
+        let success = MockWindowSubclassApi::new(false, false);
+        install_window_subclass_with_api(hwnd, &success).unwrap();
+        assert_eq!(*success.calls.borrow(), ["install"]);
+
+        let failure = MockWindowSubclassApi::new(true, false);
+        assert!(matches!(
+            install_window_subclass_with_api(hwnd, &failure),
+            Err(AppBarError::Windows(_))
+        ));
+        assert_eq!(*failure.calls.borrow(), ["install"]);
+    }
+
+    #[test]
+    fn failed_app_bar_registration_removes_the_installed_subclass() {
+        let hwnd = HWND::default();
+        let state = subclass_state_for_test(None);
+        state.borrow_mut().operation_in_progress = true;
+        SUBCLASSED_APP_BARS.with(|app_bars| {
+            app_bars.borrow_mut().insert(hwnd.0 as isize, state.clone());
+        });
+
+        let api = MockWindowSubclassApi::new(false, false);
+        let error = complete_subclass_registration(
+            hwnd,
+            &state,
+            Err(AppBarError::ShellOperationFailed {
+                operation: "registration",
+            }),
+            &api,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppBarError::ShellOperationFailed {
+                operation: "registration"
+            }
+        ));
+        assert_eq!(*api.calls.borrow(), ["remove"]);
+        assert!(subclass_state(hwnd).is_none());
+        assert!(!state.borrow().attached);
+    }
+
+    #[test]
+    fn failed_registration_reports_both_errors_when_subclass_rollback_fails() {
+        let hwnd = HWND::default();
+        let state = subclass_state_for_test(None);
+        state.borrow_mut().operation_in_progress = true;
+        SUBCLASSED_APP_BARS.with(|app_bars| {
+            app_bars.borrow_mut().insert(hwnd.0 as isize, state.clone());
+        });
+
+        let api = MockWindowSubclassApi::new(false, true);
+        let error = complete_subclass_registration(
+            hwnd,
+            &state,
+            Err(AppBarError::ShellOperationFailed {
+                operation: "registration",
+            }),
+            &api,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppBarError::SubclassRegistrationCleanup { .. }
+        ));
+        assert_eq!(*api.calls.borrow(), ["remove"]);
+        assert!(subclass_state(hwnd).is_some());
+        assert!(state.borrow().attached);
+        assert!(!state.borrow().operation_in_progress);
+
+        SUBCLASSED_APP_BARS.with(|app_bars| {
+            app_bars.borrow_mut().remove(&(hwnd.0 as isize));
+        });
+    }
+
+    #[test]
+    fn dispatch_defers_reentrant_messages_and_forwards_other_messages() {
+        let api = Rc::new(MockAppBarApi::new(RECT::default(), false));
+        let state = subclass_state_for_test(Some(app_bar_for_test(api)));
+        state.borrow_mut().operation_in_progress = true;
+
+        assert!(matches!(
+            dispatch_subclass_message(&state, APP_BAR_CALLBACK_MESSAGE, ABN_POSCHANGED as usize),
+            SubclassMessageDispatch::Consume
+        ));
+        assert!(matches!(
+            dispatch_subclass_message(&state, WM_WINDOWPOSCHANGED, 0),
+            SubclassMessageDispatch::Forward
+        ));
+
+        let state = state.borrow();
+        assert!(state.pending_reposition);
+        assert!(state.pending_window_position_changed);
+        assert!(state.app_bar.is_some());
+    }
+
+    #[test]
+    fn detach_keeps_state_when_subclass_removal_fails() {
+        let hwnd = HWND::default();
+        let state = subclass_state_for_test(None);
+        SUBCLASSED_APP_BARS.with(|app_bars| {
+            app_bars.borrow_mut().insert(hwnd.0 as isize, state.clone());
+        });
+
+        let api = MockWindowSubclassApi::new(false, true);
+        assert!(matches!(
+            detach_subclass_state_with_api(hwnd, &api),
+            Err(AppBarError::Windows(_))
+        ));
+        assert_eq!(*api.calls.borrow(), ["remove"]);
+        assert!(state.borrow().attached);
+        assert!(subclass_state(hwnd).is_some());
+
+        SUBCLASSED_APP_BARS.with(|app_bars| {
+            app_bars.borrow_mut().remove(&(hwnd.0 as isize));
+        });
+    }
+
+    #[test]
+    fn detach_removes_subclass_before_releasing_app_bar_state() {
+        let hwnd = HWND::default();
+        let app_bar_api = Rc::new(MockAppBarApi::new(RECT::default(), false));
+        let state = subclass_state_for_test(Some(app_bar_for_test(app_bar_api.clone())));
+        SUBCLASSED_APP_BARS.with(|app_bars| {
+            app_bars.borrow_mut().insert(hwnd.0 as isize, state.clone());
+        });
+
+        let api = MockWindowSubclassApi::new(false, false);
+        detach_subclass_state_with_api(hwnd, &api).unwrap();
+
+        assert_eq!(*api.calls.borrow(), ["remove"]);
+        assert!(!state.borrow().attached);
+        assert!(state.borrow().app_bar.is_none());
+        assert!(subclass_state(hwnd).is_none());
+        assert!(
+            app_bar_api
+                .messages
+                .borrow()
+                .iter()
+                .any(|(message, _)| *message == ABM_REMOVE)
+        );
+    }
+
+    #[test]
     fn deferred_subclass_notifications_are_drained_after_an_operation() {
         let api = Rc::new(MockAppBarApi::new(
             RECT {
@@ -1221,5 +1600,69 @@ mod tests {
         assert_eq!(messages[0].0, ABM_QUERYPOS);
         assert_eq!(messages[1].0, ABM_SETPOS);
         assert_eq!(messages[2].0, ABM_WINDOWPOSCHANGED);
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop; run with --ignored"]
+    fn real_window_registers_and_unregisters_a_subclassed_app_bar() {
+        let _desktop = INTERACTIVE_DESKTOP
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let window = create_integration_test_window();
+
+        let Some(app_bar) = try_register_integration_app_bar(&window) else {
+            unsafe { DestroyWindow(window.0).expect("destroy test window") };
+            return;
+        };
+        app_bar.unregister().expect("unregister AppBar");
+
+        unsafe { DestroyWindow(window.0).expect("destroy test window") };
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop; run with --ignored"]
+    fn real_window_forwards_wm_close_to_the_original_window_procedure() {
+        let _desktop = INTERACTIVE_DESKTOP
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let window = create_integration_test_window();
+        let mut close_count = 0_usize;
+        unsafe {
+            SetWindowLongPtrW(window.0, GWLP_USERDATA, (&raw mut close_count) as isize);
+        }
+
+        let Some(app_bar) = try_register_integration_app_bar(&window) else {
+            unsafe { DestroyWindow(window.0).expect("destroy test window") };
+            return;
+        };
+        unsafe {
+            SendMessageW(window.0, WM_CLOSE, None, None);
+        }
+        assert_eq!(close_count, 1);
+
+        app_bar.unregister().expect("unregister AppBar");
+        unsafe { DestroyWindow(window.0).expect("destroy test window") };
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop; run with --ignored"]
+    fn real_window_destroy_releases_subclassed_app_bar_state() {
+        let _desktop = INTERACTIVE_DESKTOP
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let window = create_integration_test_window();
+        let Some(app_bar) = try_register_integration_app_bar(&window) else {
+            unsafe { DestroyWindow(window.0).expect("destroy test window") };
+            return;
+        };
+        let state = app_bar.state.clone();
+
+        unsafe { DestroyWindow(window.0).expect("destroy test window") };
+
+        let state = state.borrow();
+        assert!(!state.attached);
+        assert!(state.app_bar.is_none());
+        drop(state);
+        drop(app_bar);
     }
 }
