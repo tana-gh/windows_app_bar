@@ -1,0 +1,13 @@
+[package]
+name = "windows_app_bar_example_bevy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A runnable example with bevy for windows_app_bar"
+publish = false
+
+[dependencies]
+bevy = "0.19.1"
+windows_app_bar = { path = "../../core" }

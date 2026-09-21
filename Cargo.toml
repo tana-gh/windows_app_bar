@@ -1,0 +1,25 @@
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["tana-gh"]
+license = "No License"
+repository = "https://github.com/tana-gh/windows_app_bar.git"
+
+[workspace]
+resolver = "2"
+members = ["core", "examples/basic", "examples/bevy"]
+
+[workspace.dependencies]
+log = "0.4"
+raw-window-handle = "0.6"
+thiserror = "2"
+
+[workspace.dependencies.windows]
+version = ">=0.59, <=0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
