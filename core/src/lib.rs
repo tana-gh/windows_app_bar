@@ -1446,6 +1446,16 @@ mod tests {
     }
 
     #[test]
+    fn explicit_unregister_removes_a_registered_app_bar_once() {
+        let api = Rc::new(MockAppBarApi::new(RECT::default(), false));
+        app_bar_for_test(api.clone()).unregister().unwrap();
+
+        let messages = api.messages.borrow();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].0, ABM_REMOVE);
+    }
+
+    #[test]
     fn subclass_installation_is_testable_without_a_real_window() {
         let hwnd = HWND::default();
         let success = MockWindowSubclassApi::new(false, false);

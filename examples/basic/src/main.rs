@@ -147,7 +147,12 @@ mod app {
             WM_CLOSE => {
                 if !state.is_null() {
                     // Remove the AppBar before Windows starts destroying its HWND.
-                    unsafe { (*state).app_bar.take() };
+                    let app_bar = unsafe { (*state).app_bar.take() };
+                    if let Some(app_bar) = app_bar
+                        && let Err(error) = app_bar.unregister()
+                    {
+                        eprintln!("failed to unregister AppBar before window destruction: {error}");
+                    }
                 }
                 unsafe { DestroyWindow(hwnd) }.ok();
                 LRESULT(0)
